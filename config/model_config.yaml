@@ -1,0 +1,39 @@
+database:
+  url: "postgresql://{username}:{password}@{host}:{port}/{dbname}"
+
+data:
+  tickers:
+    - "SPY"
+  start_date: "2000-01-01"
+  end_date: "2023-12-31"
+
+models:
+  - name: "ES"
+    features:
+      - "LogReturn"
+      - "LagSquaredLogReturn"
+  - name: "STES-E&AE"
+    features:
+      - "LogReturn"
+      - "AbsLogReturn"
+      - "LagSquaredLogReturn"
+  - name: "XGBoost-STES"
+    features:
+      - "LogReturn"
+      - "AbsLogReturn"
+      - "LagSquaredLogReturn"
+      - "LagAbsLogReturn"
+
+xgboost_params:
+  max_depth: 3
+  learning_rate: 0.1
+  n_estimators: 100
+  objective: "reg:squarederror"
+
+evaluation:
+  test_size: 0.2
+  random_state: 42
+
+scheduler:
+  daily_task_time: "00:05"
+  recalibration_day: "sun"
