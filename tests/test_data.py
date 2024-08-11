@@ -1,6 +1,6 @@
 import unittest
 from unittest.mock import patch
-from volatility_forecast.data.dataloader import TingleEoDDataLoader
+from volatility_forecast.data.dataloader import TiingoEoDDataLoader
 from volatility_forecast.data.base import Field, DataSet
 from volatility_forecast.data.dataset import PriceVolume
 import pandas as pd
@@ -12,7 +12,7 @@ class TestTingleEoDDataLoader(unittest.TestCase):
             "AAPL",
             "MSFT",
         )
-        self.loader = TingleEoDDataLoader(self.tickers)
+        self.loader = TiingoEoDDataLoader(self.tickers)
         self.fields = [PriceVolume.CLOSE, PriceVolume.VOLUME]
 
     def test_convert_name(self):
@@ -26,7 +26,7 @@ class TestPriceVolume(unittest.TestCase):
             "AAPL",
             "MSFT",
         )
-        self.loader = TingleEoDDataLoader(self.tickers)
+        self.loader = TiingoEoDDataLoader(self.tickers)
         self.fields = [PriceVolume.CLOSE, PriceVolume.VOLUME]
 
     def test_columns_exist(self):

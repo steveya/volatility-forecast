@@ -7,6 +7,10 @@ import joblib
 
 
 class BaseVolatilityModel(BaseEstimator, RegressorMixin, ABC):
+    @property
+    def model_name(self):
+        pass
+
     @abstractmethod
     def fit(self, X, y, returns):
         pass

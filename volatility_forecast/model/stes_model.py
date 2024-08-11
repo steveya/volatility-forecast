@@ -7,24 +7,26 @@ from .base_model import BaseVolatilityModel
 class STESModel(BaseVolatilityModel):
     def __init__(self, params=None):
         self.params = params
-        self.fitted_results = None
 
-    def _objective(self, params, returns, features, y):
+    def _objective(self, params, returns, features, y, burnin_size, os_index):
         n, _ = features.shape
         alphas = expit(np.dot(features, params))
+        returns2 = returns**2
         sigma2 = np.zeros(n)
         sigma2[0] = returns[0] ** 2
         for t in range(1, n):
-            sigma2[t] = (
-                alphas[t - 1] * returns[t - 1] ** 2
-                + (1 - alphas[t - 1]) * sigma2[t - 1]
-            )
-        return y - sigma2
+            sigma2[t] = alphas[t] * returns2[t] + (1 - alphas[t]) * sigma2[t - 1]
+        return (y - sigma2)[burnin_size:os_index]
 
-    def fit(self, X, y, returns):
+    def fit(self, X, y, returns, start_index, end_index):
         assert len(X) == len(y) == len(returns)
         initial_params = np.random.normal(0, 1, size=X.shape[1])
-        result = least_squares(self._objective, x0=initial_params, args=(returns, X, y))
+        result = least_squares(
+            self._objective,
+            x0=initial_params,
+            args=(returns, X, y.flatten(), start_index, end_index),
+        )
+        self.result = result
         self.params = result.x
         return self
 
@@ -33,12 +35,10 @@ class STESModel(BaseVolatilityModel):
             raise ValueError("Model not fitted")
 
         n = len(returns)
-        alphas = expit(np.dot(self.params, X))
+        alphas = expit(np.dot(X, self.params))
+        returns2 = returns**2
         sigma2 = np.zeros(n)
         sigma2[0] = returns[0] ** 2
         for t in range(1, n):
-            sigma2[t] = (
-                alphas[t - 1] * returns[t - 1] ** 2
-                + (1 - alphas[t - 1]) * sigma2[t - 1]
-            )
+            sigma2[t] = alphas[t] * returns2[t] + (1 - alphas[t]) * sigma2[t - 1]
         return sigma2

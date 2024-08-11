@@ -1,24 +1,68 @@
-import torch
+import numpy as np
 import pandas as pd
 from .base import ensure_timestamp
 from .dataset import PriceVolume
-from .dataloader import TingleEoDDataLoader
+from .dataloader import TiingoEoDDataLoader
 import pandas_market_calendars as mcal
+
+
+def get_closest_next_business_day(date, calendar):
+    custom_bday = pd.offsets.CustomBusinessDay(calendar=calendar)
+    return date - custom_bday + custom_bday
+
+
+def get_closest_prev_business_day(date, calendar):
+    custom_bday = pd.offsets.CustomBusinessDay(calendar=calendar)
+    return date + custom_bday - custom_bday
 
 
 class ReturnDataManager:
     def get_data(
         self, universe, start_date, end_date, calendar=mcal.get_calendar("NYSE")
     ):
-        offset_start_date = ensure_timestamp(start_date) - calendar.holidays()
-        adj_price = PriceVolume.CLOSE.get_data(
-            TingleEoDDataLoader(universe), offset_start_date, end_date
+        custom_bday = pd.offsets.CustomBusinessDay(calendar=calendar)
+        offset_start_date = (
+            get_closest_next_business_day(
+                ensure_timestamp(start_date), calendar=calendar
+            )
+            - custom_bday
         )
-        tensor = torch.tensor(adj_price.to_numpy())
-        return torch.diff(torch.log(tensor), axis=0)
+        offset_end_date = get_closest_prev_business_day(
+            ensure_timestamp(end_date), calendar=calendar
+        )
+        adj_price = PriceVolume.CLOSE.get_data(
+            TiingoEoDDataLoader(universe), offset_start_date, offset_end_date
+        )
+        data = adj_price.to_numpy()
+        return np.diff(np.log(data), axis=0)
 
 
 class OffsetReturnDataManager:
+    def __init__(self, lag):
+        self.lag = lag
+        super().__init__()
+
+    def get_data(
+        self, universe, start_date, end_date, calendar=mcal.get_calendar("NYSE")
+    ):
+        custom_bday = pd.offsets.CustomBusinessDay(calendar=calendar)
+        offset_start_date = (
+            get_closest_next_business_day(
+                ensure_timestamp(start_date), calendar=calendar
+            )
+            - custom_bday * self.lag
+        )
+        offset_end_date = (
+            get_closest_prev_business_day(ensure_timestamp(end_date), calendar=calendar)
+            - custom_bday * self.lag
+        )
+        data = ReturnDataManager().get_data(
+            universe, offset_start_date, offset_end_date, calendar
+        )
+        return data
+
+
+class LagReturnDataManager:
     def __init__(self, lag=1):
         self.lag = lag
         super().__init__()
@@ -26,12 +70,12 @@ class OffsetReturnDataManager:
     def get_data(
         self, universe, start_date, end_date, calendar=mcal.get_calendar("NYSE")
     ):
-        offset_start_date = ensure_timestamp(start_date) - calendar.holidays()
-        offset_end_date = ensure_timestamp(end_date) - calendar.holidays()
-        tensor = ReturnDataManager().get_data(
-            universe, offset_start_date, offset_end_date, calendar
+        return OffsetReturnDataManager(lag=self.lag).get_data(
+            universe, start_date, end_date, calendar
         )
-        return tensor
+
+    def __repr__(self) -> str:
+        return f"LagReturnDataManager(lag={self.lag})"
 
 
 class LagAbsReturnDataManager:
@@ -42,10 +86,13 @@ class LagAbsReturnDataManager:
     def get_data(
         self, universe, start_date, end_date, calendar=mcal.get_calendar("NYSE")
     ):
-        tensor = OffsetReturnDataManager(lag=self.lag).get_data(
+        data = OffsetReturnDataManager(lag=self.lag).get_data(
             universe, start_date, end_date, calendar
         )
-        return torch.abs(tensor)
+        return np.abs(data)
+
+    def __repr__(self) -> str:
+        return f"LagAbsReturnDataManager(lag={self.lag})"
 
 
 class LagSquareReturnDataManager:
@@ -56,17 +103,23 @@ class LagSquareReturnDataManager:
     def get_data(
         self, universe, start_date, end_date, calendar=mcal.get_calendar("NYSE")
     ):
-        tensor = OffsetReturnDataManager(lag=self.lag).get_data(
+        data = OffsetReturnDataManager(lag=self.lag).get_data(
             universe, start_date, end_date, calendar
         )
-        return tensor**2
+        return data**2
+
+    def __repr__(self) -> str:
+        return f"LagSquareReturnDataManager(lag={self.lag})"
 
 
-class OneStepAheadSquareReturnDataManager:
+class SquareReturnDataManager:
     def get_data(
         self, universe, start_date, end_date, calendar=mcal.get_calendar("NYSE")
     ):
-        tensor = LagSquareReturnDataManager(lag=-1).get_data(
+        data = OffsetReturnDataManager(lag=0).get_data(
             universe, start_date, end_date, calendar
         )
-        return tensor
+        return data**2
+
+    def __repr__(self) -> str:
+        return "SquareReturnDataManager()"

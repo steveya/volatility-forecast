@@ -9,12 +9,12 @@ from .base import DataLoader, DataField
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
-def get_tingle_api():
+def get_tiingo_api():
     load_dotenv()
-    return os.getenv("TINGLE_API")
+    return os.getenv("TIINGO_API")
 
 
-class TingleEoDDataLoader(DataLoader):
+class TiingoEoDDataLoader(DataLoader):
     def __init__(self, tickers: List[str]) -> None:
         self.tickers = tickers
         super().__init__()
@@ -69,7 +69,7 @@ class TingleEoDDataLoader(DataLoader):
                         print(f"{key} generated an exception: {exc}")
             return results
 
-        api_key = get_tingle_api()
+        api_key = get_tiingo_api()
         sdate_str = start_date.strftime("%Y-%m-%d")
         edate_str = end_date.strftime("%Y-%m-%d")
 

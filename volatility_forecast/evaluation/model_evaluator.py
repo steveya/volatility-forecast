@@ -1,25 +1,27 @@
-# evaluation.py
 import numpy as np
 from sklearn.metrics import mean_squared_error
 
 
-class Evaluator:
-    def __init__(self, data_manager):
-        self.data_manager = data_manager
+def root_mean_squared_error(y_true, y_pred):
+    return np.sqrt(mean_squared_error(y_true, y_pred))
 
-    def calculate_rmse(self, true_values, predictions):
-        return np.sqrt(mean_squared_error(true_values, predictions))
 
-    def evaluate_model(self, model, test_data):
-        predictions = model.predict(test_data)
-        true_values = test_data["squared_returns"]
-        return self.calculate_rmse(true_values, predictions)
+def evaluate_model(data_provider, model, metrics, is_index, os_index, oos_index=None):
+    X, y, returns = data_provider()
 
-    def compare_models(self, new_model, old_model, test_data):
-        new_rmse = self.evaluate_model(new_model, test_data)
-        old_rmse = self.evaluate_model(old_model, test_data)
-        return {
-            "new_model_rmse": new_rmse,
-            "old_model_rmse": old_rmse,
-            "improvement": old_rmse - new_rmse,
-        }
+    test_sample = slice(os_index, oos_index)
+
+    model.fit(X, y, returns, is_index, os_index)
+
+    y_pred = model.predict(X, returns)
+    return metrics(y_pred[test_sample], y[test_sample])
+
+
+def compare_models(new_model, old_model, test_data):
+    new_rmse = evaluate_model(new_model, test_data)
+    old_rmse = evaluate_model(old_model, test_data)
+    return {
+        "new_model_rmse": new_rmse,
+        "old_model_rmse": old_rmse,
+        "improvement": old_rmse - new_rmse,
+    }
