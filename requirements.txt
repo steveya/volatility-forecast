@@ -10,7 +10,7 @@ scikit-learn==1.0.2
 xgboost==1.5.0
 
 # Data fetching
-yfinance==0.1.70
+pandas_market_calendars==4.4.1
 
 # Web framework
 Flask==2.0.2

@@ -13,7 +13,8 @@ DEFAULT_XGBOOST_PARAMS = {
     "colsample_bylevel": 0.8,  # Column subsampling at level level
     "colsample_bynode": 0.8,  # Column subsampling at node level
     "reg_lambda": 1.0,  # L2 regularization
-    "random_state": 42,  # Seed for reproducibility
+    "random_state": 42,  # Seed for reproducibility,
+    'verbosity': 0
 }
 
 
@@ -59,7 +60,14 @@ class XGBoostSTESModel(BaseVolatilityModel):
 
         return grads, hesss
 
-    def fit(self, X, y, returns, start_index, end_index):
+    def fit(self, X, y, returns=None, start_index=None, end_index=None):
+        if returns is None:
+            returns = X[:, 1]
+        if start_index is None:
+            start_index = 0
+        if end_index is None:
+            end_index = len(returns)
+
         dtrain = xgb.DMatrix(
             X[start_index:end_index, :], label=y[start_index:end_index]
         )
@@ -74,7 +82,7 @@ class XGBoostSTESModel(BaseVolatilityModel):
         )
         return self
 
-    def predict(self, X, returns):
+    def predict(self, X, returns=None):
         """
         This function generates predictions for the 1-step ahead variance
         from the features time series. Since the variance is recursively
@@ -90,6 +98,9 @@ class XGBoostSTESModel(BaseVolatilityModel):
         Returns:
             np.ndarray: The 1-step ahead variance predictions.
         """
+        if returns is None:
+            returns = X[:, 1]
+            
         alphas = expit(self.model.predict(xgb.DMatrix(X)))
 
         returns2 = returns**2
@@ -99,6 +110,19 @@ class XGBoostSTESModel(BaseVolatilityModel):
             var_pred[t] = alphas[t] * returns2[t] + (1 - alphas[t]) * var_pred[t - 1]
 
         return var_pred
+
+    # Scikit-learn interface
+    def get_params(self, deep=True):
+        """
+        Return the parameters of the estimator.
+        """
+        return self.xgb_params
+
+    def set_params(self, **params):
+        for key, value in params.items():
+            self.xgb_params[key] = value
+
+        return self
 
     def save(self, filename):
         self.model.save_model(filename + ".model")
