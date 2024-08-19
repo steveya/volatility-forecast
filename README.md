@@ -1,7 +1,7 @@
 # volatility-forecast
 This repository contains the [notebook](https://github.com/steveta/volatility-forecast/blob/main/volatility_forecast/notebooks/stes_volatility_forecast.ipynb) that produced the blog posts [Volatility Forecasts](https://steveya.github.io/tags/volatility-forecast/). 
 
-The repo also contains a package that aims to wrap all the volatility forecasting models into a single package that is compatible with the scikit-learn API. The package also contains the Flask app that will produce daily volatility forecasts from each model (and new models.) The package is currently under development and is not ready for use. 
+The repo also contains a package that aims to wrap all the volatility forecasting models into a single package that is compatible with the scikit-learn API. This repo also contains a work-in-progress Flask app that will produce daily volatility forecasts from each model (and new models.) The app package is currently under development and is not ready for use. 
 
 ## Executive Summary
 
