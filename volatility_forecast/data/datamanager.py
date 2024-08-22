@@ -33,7 +33,8 @@ class ReturnDataManager:
             self.data_loader_type(universe), offset_start_date, offset_end_date
         )
         data = adj_price.to_numpy()
-        return np.diff(np.log(data), axis=0)
+        date = adj_price.index
+        return np.diff(np.log(data), axis=0), date
 
 
 class OffsetReturnDataManager:
@@ -56,10 +57,10 @@ class OffsetReturnDataManager:
             get_closest_prev_business_day(ensure_timestamp(end_date), calendar=calendar)
             - custom_bday * self.lag
         )
-        data = ReturnDataManager(data_loader_type=self.data_loader_type).get_data(
+        data, date = ReturnDataManager(data_loader_type=self.data_loader_type).get_data(
             universe, offset_start_date, offset_end_date, calendar
         )
-        return data
+        return data, date
 
 
 class LagReturnDataManager:
@@ -100,10 +101,10 @@ class LagAbsReturnDataManager:
         end_date: DateLike,
         calendar=mcal.get_calendar("NYSE"),
     ) -> pd.DataFrame:
-        data = OffsetReturnDataManager(
+        data, date = OffsetReturnDataManager(
             lag=self.lag, data_loader_type=self.data_loader_type
         ).get_data(universe, start_date, end_date, calendar)
-        return np.abs(data)
+        return np.abs(data), date
 
     def __repr__(self) -> str:
         return f"LagAbsReturnDataManager(lag={self.lag})"
@@ -124,10 +125,10 @@ class LagSquareReturnDataManager:
         end_date: DateLike,
         calendar=mcal.get_calendar("NYSE"),
     ) -> pd.DataFrame:
-        data = OffsetReturnDataManager(
+        data, date = OffsetReturnDataManager(
             lag=self.lag, data_loader_type=self.data_loader_type
         ).get_data(universe, start_date, end_date, calendar)
-        return data**2
+        return data**2, date
 
     def __repr__(self) -> str:
         return f"LagSquareReturnDataManager(lag={self.lag})"
@@ -144,10 +145,10 @@ class SquareReturnDataManager:
         end_date: DateLike,
         calendar=mcal.get_calendar("NYSE"),
     ) -> pd.DataFrame:
-        data = OffsetReturnDataManager(
+        data, date = OffsetReturnDataManager(
             lag=0, data_loader_type=self.data_loader_type
         ).get_data(universe, start_date, end_date, calendar)
-        return data**2
+        return data**2, date
 
     def __repr__(self) -> str:
         return "SquareReturnDataManager()"

@@ -1,0 +1,3 @@
+TICKERS = ("SPY", )
+CALENDAR = ("NYSE", )
+START_DATE = "2000-01-01"
