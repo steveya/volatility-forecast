@@ -101,7 +101,7 @@ class TiingoEoDDataLoader(DataLoader):
             keys=all_data.keys(),
         )
         combined_data = combined_data.swaplevel(0, 1, axis=1).sort_index(axis=1)
-        combined_data.index = combined_data.index.tz_convert(None)
+        # combined_data.index = combined_data.index.tz_convert(None)
         return combined_data
 
 
@@ -231,7 +231,7 @@ class TiingoEodDataLoaderProd(DataLoader):
             return pd.DataFrame()
 
         df = pd.DataFrame(data).set_index("date")
-        df.index = pd.to_datetime(df.index).normalize()
+        df.index = pd.to_datetime(df.index)
         return df
 
 

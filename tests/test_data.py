@@ -1,7 +1,9 @@
+import pandas as pd
+import pandas_market_calendars as mcal
+
 from datetime import datetime, timedelta
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy import create_engine
-import pandas as pd
 
 import unittest
 from unittest.mock import patch
@@ -11,6 +13,10 @@ from volatility_forecast.data.dataloader import (
     TiingoEodDataLoaderProd,
 )
 from volatility_forecast.data.base import Field, DataSet
+from volatility_forecast.data.date_util import (
+    get_closest_next_business_day,
+    get_closest_prev_business_day,
+)
 from volatility_forecast.data.dataset import PriceVolume
 from volatility_forecast.data.persistence import persist_data, load_data_from_db
 from volatility_forecast.data.database import engine, Base
@@ -76,19 +82,23 @@ class TestDataSet(unittest.TestCase):
 
 
 class TestLoaderAndPersistence(unittest.TestCase):
-
     @classmethod
     def setUpClass(cls):
         # Create tables
         Base.metadata.create_all(engine)
 
         cls.tickers = (
+            "SPY",
             "AAPL",
-            "GOOGL",
-            "MSFT",
         )
-        cls.end_date = datetime.now().date()
-        cls.start_date = cls.end_date - timedelta(days=30)
+        cls.end_date = get_closest_prev_business_day(
+            datetime.now().date() - timedelta(days=5),
+            mcal.get_calendar("NYSE"),
+        )
+        cls.start_date = get_closest_next_business_day(
+            cls.end_date - timedelta(days=30),
+            mcal.get_calendar("NYSE"),
+        )
         cls.loader = TiingoEodDataLoaderProd(cls.tickers)
 
     def setUp(self):
@@ -167,8 +177,15 @@ class TestDatabaseDataLoader(unittest.TestCase):
             "AAPL",
             "GOOGL",
         )
-        cls.end_date = datetime.now().date()
-        cls.start_date = cls.end_date - timedelta(days=10)
+
+        cls.end_date = get_closest_prev_business_day(
+            datetime.now().date() - timedelta(days=5),
+            mcal.get_calendar("NYSE"),
+        )
+        cls.start_date = get_closest_next_business_day(
+            cls.end_date - timedelta(days=30),
+            mcal.get_calendar("NYSE"),
+        )
 
         # Create some test data
         cls.test_data = {}
