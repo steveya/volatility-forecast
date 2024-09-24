@@ -1,3 +1,8 @@
-TICKERS = ("SPY", )
-CALENDAR = ("NYSE", )
-START_DATE = "2000-01-01"
+database:
+  url: "postgresql://{username}:{password}@{host}:{port}/{dbname}"
+
+data:
+  tickers:
+    - "SPY"
+  start_date: "2000-01-01"
+  end_date: "2023-12-31"

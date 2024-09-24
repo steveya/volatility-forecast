@@ -683,7 +683,18 @@ def ensure_timestamp(date: Optional[DateLike]) -> Optional[pd.Timestamp]:
     -------
     pd.Timestamp or None
     """
-    return pd.Timestamp(date) if date is not None else None
+    if isinstance(date, str):
+        dt = pd.Timestamp(date)
+    elif isinstance(date, pd.Timestamp):
+        dt = date
+    elif date is None:
+        return None
+    else:
+        raise TypeError("Invalid date type")
+    
+    if dt.tzinfo is None:
+        dt = dt.tz_localize("UTC")
+    return dt
 
 
 class ParametrizedSingleton(ABCMeta):

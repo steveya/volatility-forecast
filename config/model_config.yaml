@@ -1,34 +1,29 @@
-database:
-  url: "postgresql://{username}:{password}@{host}:{port}/{dbname}"
-
-data:
-  tickers:
-    - "SPY"
-  start_date: "2000-01-01"
-  end_date: "2023-12-31"
-
 models:
   - name: "ES"
+    model_type: "volatility_forecast.model.stes_model.STESModel"
+    features: []
+  - name: "STES-E&AE&SE"
+    model_type: "volatility_forecast.model.stes_model.STESModel"
     features:
-      - "LogReturn"
-      - "LagSquaredLogReturn"
+      - "LagReturn"
+      - "LagAbsReturn"
+      - "LagSquaredReturn"
   - name: "STES-E&AE"
+    model_type: "volatility_forecast.model.stes_model.STESModel"
     features:
-      - "LogReturn"
-      - "AbsLogReturn"
-      - "LagSquaredLogReturn"
+      - "LagReturn"
+      - "LagAbsReturn"
   - name: "XGBoost-STES"
+    model_type: "volatility_forecast.model.xgboost_stes_model.XGBoostSTESModel"
     features:
-      - "LogReturn"
-      - "AbsLogReturn"
-      - "LagSquaredLogReturn"
-      - "LagAbsLogReturn"
-
-xgboost_params:
-  max_depth: 3
-  learning_rate: 0.1
-  n_estimators: 100
-  objective: "reg:squarederror"
+      - "LagReturn"
+      - "LagSquaredReturn"
+      - "LagAbsReturn"
+    params:
+      max_depth: 3
+      learning_rate: 0.1
+      n_estimators: 100
+      objective: "reg: squared error"
 
 evaluation:
   test_size: 0.2
