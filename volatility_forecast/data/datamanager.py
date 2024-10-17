@@ -37,6 +37,43 @@ class ReturnDataManager:
         return np.diff(np.log(data), axis=0), date
 
 
+class HighLownDataManager:
+    def __init__(
+        self, lag: int = 1, data_loader_type: Type = TiingoEoDDataLoader
+    ) -> NoReturn:
+        self.lag = lag
+        self.data_loader_type = data_loader_type
+
+    def get_data(
+        self,
+        universe: List[str],
+        start_date: DateLike,
+        end_date: DateLike,
+        calendar=mcal.get_calendar("NYSE"),
+    ) -> pd.DataFrame:
+        custom_bday = pd.offsets.CustomBusinessDay(calendar=calendar)
+        offset_start_date = (
+            get_closest_next_business_day(
+                ensure_timestamp(start_date), calendar=calendar
+            )
+            - custom_bday * self.lag
+        )
+        offset_end_date = (
+            get_closest_prev_business_day(ensure_timestamp(end_date), calendar=calendar)
+            - custom_bday * self.lag
+        )
+
+        adj_high = PriceVolume.HIGH.get_data(
+            self.data_loader_type(universe), offset_start_date, offset_end_date
+        )
+        adj_low = PriceVolume.LOW.get_data(
+            self.data_loader_type(universe), offset_start_date, offset_end_date
+        )
+        data = np.log(adj_high.to_numpy()) - np.log(adj_low.to_numpy())
+        date = adj_high.index
+        return data, date
+
+
 class OffsetReturnDataManager:
     def __init__(self, lag, data_loader_type: Type = TiingoEoDDataLoader) -> NoReturn:
         self.lag = lag

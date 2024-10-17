@@ -12,11 +12,11 @@ class BaseVolatilityModel(BaseEstimator, RegressorMixin, ABC):
         pass
 
     @abstractmethod
-    def fit(self, X, y, returns):
+    def fit(self, X, y, **kwargs):
         pass
 
     @abstractmethod
-    def predict(self, X, returns):
+    def predict(self, X, **kwargs):
         pass
 
     def save(self, filename):

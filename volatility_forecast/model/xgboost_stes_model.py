@@ -14,7 +14,7 @@ DEFAULT_XGBOOST_PARAMS = {
     "colsample_bynode": 0.8,  # Column subsampling at node level
     "reg_lambda": 1.0,  # L2 regularization
     "random_state": 42,  # Seed for reproducibility,
-    'verbosity': 0
+    "verbosity": 0,
 }
 
 
@@ -60,13 +60,13 @@ class XGBoostSTESModel(BaseVolatilityModel):
 
         return grads, hesss
 
-    def fit(self, X, y, returns=None, start_index=None, end_index=None):
+    def fit(self, X, y, **kwargs):
+        returns = kwargs.pop("returns", None)
+        start_index = kwargs.pop("start_index", 0)
+        end_index = kwargs.pop("end_index", len(X))
+
         if returns is None:
             returns = X[:, 1]
-        if start_index is None:
-            start_index = 0
-        if end_index is None:
-            end_index = len(returns)
 
         dtrain = xgb.DMatrix(
             X[start_index:end_index, :], label=y[start_index:end_index]
@@ -82,7 +82,7 @@ class XGBoostSTESModel(BaseVolatilityModel):
         )
         return self
 
-    def predict(self, X, returns=None):
+    def predict(self, X, **kwargs):
         """
         This function generates predictions for the 1-step ahead variance
         from the features time series. Since the variance is recursively
@@ -98,9 +98,11 @@ class XGBoostSTESModel(BaseVolatilityModel):
         Returns:
             np.ndarray: The 1-step ahead variance predictions.
         """
+        returns = kwargs.pop("returns", None)
+
         if returns is None:
             returns = X[:, 1]
-            
+
         alphas = expit(self.model.predict(xgb.DMatrix(X)))
 
         returns2 = returns**2
