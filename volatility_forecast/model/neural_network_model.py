@@ -5,12 +5,13 @@ from .base_model import BaseVolatilityModel
 
 
 class BaseNNVolatilityModel(nn.Module, BaseVolatilityModel):
-    def __init__(self):
+    def __init__(self, max_grad_norm=1):
         nn.Module.__init__(self)
         BaseVolatilityModel.__init__(self)
         self.device = torch.device(
             "mps" if torch.backends.mps.is_available() else "cpu"
         )
+        self.max_grad_norm = max_grad_norm
 
     def to_device(self):
         self.to(self.device)
@@ -21,22 +22,31 @@ class BaseNNVolatilityModel(nn.Module, BaseVolatilityModel):
         start_index = kwargs.pop("start_index", 0)
         end_index = kwargs.pop("end_index", len(X))
         epochs = kwargs.pop("epochs", 50)
-
+        verbose = kwargs.pop("verbose", True)  # Add a verbose option
+        learning_rate = kwargs.pop("learning_rate", 0.01)
         self.to_device()
 
         X_tensor = torch.FloatTensor(X[start_index:end_index]).to(self.device)
         y_tensor = torch.FloatTensor(y[start_index:end_index]).to(self.device)
 
-        optimizer = torch.optim.Adam(self.parameters())
+        optimizer = torch.optim.Adam(self.parameters(), lr=learning_rate)
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.1)
+
         criterion = nn.MSELoss()
 
         for epoch in range(epochs):  # Increased number of epochs
             self.train()
             optimizer.zero_grad()
-            output = self(X_tensor)
+            output = self(X_tensor).reshape(-1, 1)
             loss = criterion(output, y_tensor)
+
             loss.backward()
+            nn.utils.clip_grad_norm_(self.parameters(), max_norm=self.max_grad_norm)
             optimizer.step()
+            scheduler.step()
+
+            if verbose:
+                print(f"Epoch {epoch+1}/{epochs}, Loss: {loss.item():.6f}")
 
         return self
 
@@ -89,8 +99,9 @@ class RNNVolatilityModel(BaseNNVolatilityModel):
         dropout=0,
         bias=False,
         nonlinearity="tanh",
+        max_grad_norm=1,
     ):
-        super(RNNVolatilityModel, self).__init__()
+        super(RNNVolatilityModel, self).__init__(max_grad_norm)
         self.rnn = nn.RNN(
             input_size,
             hidden_size,
@@ -101,6 +112,7 @@ class RNNVolatilityModel(BaseNNVolatilityModel):
             nonlinearity=nonlinearity,
         )
         self.fc = nn.Linear(hidden_size, 1)
+        self.bn_input = nn.BatchNorm1d(input_size)
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.to_device()
@@ -109,6 +121,7 @@ class RNNVolatilityModel(BaseNNVolatilityModel):
         return torch.zeros(self.num_layers, 1, self.hidden_size).to(self.device)
 
     def forward(self, x):
+        x = self.bn_input(x)
         h0 = self.init_hidden()
         out, _ = self.rnn(x.unsqueeze(1), h0)
         out = self.fc(out[:, -1, :])
@@ -124,8 +137,9 @@ class GRUVolatilityModel(BaseNNVolatilityModel):
         num_layers=1,
         dropout=0,
         bias=False,
+        max_grad_norm=1,
     ):
-        super(GRUVolatilityModel, self).__init__()
+        super(GRUVolatilityModel, self).__init__(max_grad_norm)
         self.gru = nn.GRU(
             input_size,
             hidden_size,
@@ -135,6 +149,7 @@ class GRUVolatilityModel(BaseNNVolatilityModel):
             bias=bias,
         )
         self.fc = nn.Linear(hidden_size, 1)
+        self.bn_input = nn.BatchNorm1d(input_size)
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.to_device()
@@ -143,6 +158,7 @@ class GRUVolatilityModel(BaseNNVolatilityModel):
         return torch.zeros(self.num_layers, 1, self.hidden_size).to(self.device)
 
     def forward(self, x):
+        x = self.bn_input(x)
         h0 = self.init_hidden()
         out, _ = self.gru(x.unsqueeze(1), h0)
         out = self.fc(out[:, -1, :])
