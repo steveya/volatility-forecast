@@ -78,17 +78,36 @@ class STESModel(BaseVolatilityModel):
 
     # ---------- model logic ----------
     def _objective(self, params, returns, features, y, burnin_size, os_index):
+        """Least-squares residuals for STES.
+
+        Conventions (important):
+        - Features X_t and returns r_t are information available at time t (end of date t).
+        - Target y[t] is the *next-day* squared return r_{t+1}^2, shifted to time t.
+        - We keep the STES recursion in its standard form:
+
+              v_{t+1} = alpha_t * r_t^2 + (1 - alpha_t) * v_t
+
+          where v_{t+1} is the forecast made at time t about the next period.
+        - Therefore, the model-implied forecast aligned to row t is vhat_next[t] = v_{t+1}.
+        """
         n, _ = features.shape
         alphas = expit(np.dot(features, params))
         returns2 = returns**2
-        sigma2 = np.zeros(n)
-        sigma2[0] = returns[0] ** 2
-        for t in range(1, n):
-            # Use alphas[t-1] so alpha_t forecasts sigma_{t+1} (consistent with our feature/target alignment)
-            sigma2[t] = (
-                alphas[t - 1] * returns2[t - 1] + (1 - alphas[t - 1]) * sigma2[t - 1]
-            )
-        return (y - sigma2)[burnin_size:os_index]
+
+        # v_t state and next-step forecast v_{t+1} aligned to row t
+        v_state = np.zeros(n + 1)
+        vhat_next = np.zeros(n)
+
+        # Initialize v_0 (state before observing the first update). We use r_0^2 as a simple anchor.
+        # (Callers typically use burn-in / slicing to avoid over-weighting this initialization.)
+        v_state[0] = returns2[0]
+
+        for t in range(n):
+            vhat_next[t] = alphas[t] * returns2[t] + (1.0 - alphas[t]) * v_state[t]
+            v_state[t + 1] = vhat_next[t]
+
+        # Residuals compare y[t]=r_{t+1}^2 against the forecast made at time t: v_{t+1}
+        return (y - vhat_next)[burnin_size:os_index]
 
     def fit(self, X, y, **kwargs):
         returns = kwargs.pop("returns", None)
@@ -123,6 +142,10 @@ class STESModel(BaseVolatilityModel):
         return self
 
     def predict(self, X, **kwargs):
+        sigma2, _ = self.predict_with_alpha(X, **kwargs)
+        return sigma2
+
+    def predict_with_alpha(self, X, **kwargs):
         returns = kwargs.pop("returns", None)
         assert returns is not None, "predict() requires returns=..."
 
@@ -142,14 +165,17 @@ class STESModel(BaseVolatilityModel):
         alphas = expit(np.dot(X_np, self.params))
         returns2 = r_np**2
 
-        sigma2 = np.zeros(n)
-        sigma2[0] = r_np[0] ** 2
-        for t in range(1, n):
-            # Use alphas[t-1] so alpha_t forecasts sigma_{t+1} (consistent with our feature/target alignment)
-            sigma2[t] = (
-                alphas[t - 1] * returns2[t - 1] + (1 - alphas[t - 1]) * sigma2[t - 1]
-            )
-        return sigma2
+        # Standard recursion: v_{t+1} = alpha_t r_t^2 + (1-alpha_t) v_t
+        v_state = np.zeros(n + 1)
+        sigma2_next = np.zeros(n)
+
+        v_state[0] = returns2[0]
+        for t in range(n):
+            sigma2_next[t] = alphas[t] * returns2[t] + (1.0 - alphas[t]) * v_state[t]
+            v_state[t + 1] = sigma2_next[t]
+
+        return sigma2_next, alphas
+
 
     # ---------- persistence ----------
     def save(self, filename: str, *, format: str = "joblib"):

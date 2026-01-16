@@ -146,6 +146,25 @@ def build_vol_dataset(
     return X, y, ret, catalog
 
 
+
+def build_wide_dataset(ctx: DataContext, spec: VolDatasetSpec, *, entity_id: str):
+    """Build a wide dataset for one entity."""
+    X, y, returns, catalog = build_vol_dataset(ctx, spec, persist=False)
+
+    X1 = X.xs(entity_id, level="entity_id").sort_index().copy()
+    y1 = y.xs(entity_id, level="entity_id").sort_index()
+    r1 = returns.xs(entity_id, level="entity_id").sort_index()
+
+    if "const" not in X1.columns:
+        X1["const"] = 1.0
+
+    # strict alignment
+    idx = X1.index.intersection(y1.index).intersection(r1.index)
+    X1, y1, r1 = X1.loc[idx], y1.loc[idx], r1.loc[idx]
+
+    return X1, y1, r1, catalog
+
+
 def to_numpy_1d_bundle(
     X: pd.DataFrame,
     y: pd.Series,

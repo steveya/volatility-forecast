@@ -65,17 +65,40 @@ class XGBoostSTESModel(BaseVolatilityModel):
         start_index = kwargs.pop("start_index", 0)
         end_index = kwargs.pop("end_index", len(X))
 
+        Xn = (
+            X.to_numpy(dtype=float)
+            if hasattr(X, "to_numpy")
+            else np.asarray(X, dtype=float)
+        )
+        yn = (
+            y.to_numpy(dtype=float)
+            if hasattr(y, "to_numpy")
+            else np.asarray(y, dtype=float)
+        )
+
         if returns is None:
-            returns = X[:, 1]
+            raise ValueError("XGBoostSTESModel.fit requires `returns=` to be provided")
+        rn = (
+            returns.to_numpy(dtype=float)
+            if hasattr(returns, "to_numpy")
+            else np.asarray(returns, dtype=float)
+        )
+
+        params = dict(self.xgb_params)
+        num_boost_round = int(params.pop("num_boost_round", 10))
+        # xgboost.train uses `seed`, not `random_state`.
+        if "random_state" in params and "seed" not in params:
+            params["seed"] = int(params.pop("random_state"))
 
         dtrain = xgb.DMatrix(
-            X[start_index:end_index, :], label=y[start_index:end_index]
+            Xn[start_index:end_index, :], label=yn[start_index:end_index]
         )
         self.model = xgb.train(
-            self.xgb_params,
+            params,
             dtrain,
+            num_boost_round=num_boost_round,
             obj=partial(
-                self._stes_variance_objective, returns=returns[start_index:end_index]
+                self._stes_variance_objective, returns=rn[start_index:end_index]
             ),
             evals=[(dtrain, "train")],
             verbose_eval=False,
@@ -98,20 +121,46 @@ class XGBoostSTESModel(BaseVolatilityModel):
         Returns:
             np.ndarray: The 1-step ahead variance predictions.
         """
+        var_pred, _ = self.predict_with_alpha(X, **kwargs)
+        return var_pred
+
+    def predict_with_alpha(self, X, **kwargs):
+        """
+        This function generates predictions for the 1-step ahead variance
+        and returns the alpha series as well.
+
+        Args:
+            X (pd.DataFrame): The features time series.
+
+        Returns:
+            tuple[np.ndarray, np.ndarray]: The 1-step ahead variance predictions and the alpha series.
+        """
         returns = kwargs.pop("returns", None)
 
+        Xn = (
+            X.to_numpy(dtype=float)
+            if hasattr(X, "to_numpy")
+            else np.asarray(X, dtype=float)
+        )
         if returns is None:
-            returns = X[:, 1]
+            raise ValueError(
+                "XGBoostSTESModel.predict_with_alpha requires `returns=` to be provided"
+            )
+        rn = (
+            returns.to_numpy(dtype=float)
+            if hasattr(returns, "to_numpy")
+            else np.asarray(returns, dtype=float)
+        )
 
-        alphas = expit(self.model.predict(xgb.DMatrix(X)))
+        alphas = expit(self.model.predict(xgb.DMatrix(Xn)))
 
-        returns2 = returns**2
+        returns2 = rn**2
         var_pred = np.zeros_like(alphas)
-        var_pred[0] = returns[0] ** 2
+        var_pred[0] = rn[0] ** 2
         for t in range(1, len(returns2)):
             var_pred[t] = alphas[t] * returns2[t] + (1 - alphas[t]) * var_pred[t - 1]
 
-        return var_pred
+        return var_pred, alphas
 
     # Scikit-learn interface
     def get_params(self, deep=True):

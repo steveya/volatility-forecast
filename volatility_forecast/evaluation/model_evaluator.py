@@ -3,8 +3,20 @@ import pandas as pd
 from sklearn.metrics import mean_squared_error
 
 
-def root_mean_squared_error(y_true, y_pred):
+def rmse(y_true, y_pred):
     return np.sqrt(mean_squared_error(y_true, y_pred))
+
+
+def mae(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    return float(np.mean(np.abs(y_true - y_pred)))
+
+
+def medae(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    return float(np.median(np.abs(y_true - y_pred)))
 
 
 def evaluate_model(data_provider, model, metrics, is_index, os_index, oos_index=None):

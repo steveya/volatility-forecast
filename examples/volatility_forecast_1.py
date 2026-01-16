@@ -73,6 +73,7 @@ from volatility_forecast.pipeline import (
     build_default_ctx,
     build_vol_dataset,
     VolDatasetSpec,
+    build_wide_dataset,
 )
 
 # Features/targets
@@ -81,13 +82,22 @@ from volatility_forecast.features.return_features import (
     LagAbsLogReturnTemplate,
     LagSquaredLogReturnTemplate,
 )
+from volatility_forecast.features.selector import select_variant_columns
 from volatility_forecast.targets.squared_return import NextDaySquaredReturnTarget
+
 
 # Models
 from volatility_forecast.model.es_model import ESModel
 from volatility_forecast.model.stes_model import STESModel
 
 # Simulated data
+from volatility_forecast.reporting.plots import (
+    plot_gate_diagnostics,
+    plot_forecast_panel,
+    plot_event_paths,
+    plot_bar_series,
+    plot_gate_panel,
+)
 from volatility_forecast.sources.simulated_garch import SimulatedGARCHSource
 
 
@@ -252,62 +262,8 @@ def _build_spy_spec(lags: int) -> VolDatasetSpec:
     )
 
 
-def _build_wide_data(ctx: DataContext, spec: VolDatasetSpec, *, entity_id: str = ENTITY):
-    """Build a wide dataset for one entity."""
-    X, y, returns, catalog = build_vol_dataset(ctx, spec, persist=False)
-
-    X1 = X.xs(entity_id, level="entity_id").sort_index().copy()
-    y1 = y.xs(entity_id, level="entity_id").sort_index()
-    r1 = returns.xs(entity_id, level="entity_id").sort_index()
-
-    if "const" not in X1.columns:
-        X1["const"] = 1.0
-
-    # strict alignment
-    idx = X1.index.intersection(y1.index).intersection(r1.index)
-    X1, y1, r1 = X1.loc[idx], y1.loc[idx], r1.loc[idx]
-
-    return X1, y1, r1, catalog
 
 
-def _infer_feature_group(col: str) -> str:
-    """Infer feature group from column name."""
-    lc = col.lower()
-    if "abs" in lc:
-        return "abs"
-    if "squared" in lc or "sq" in lc:
-        return "sq"
-    if "log" in lc or "ret" in lc:
-        return "raw"
-    return "raw"  # default
-
-
-def _select_variant_columns(X: pd.DataFrame, variant: str) -> list[str]:
-    """Select columns for a variant; include const when present."""
-    groups_needed = {
-        "ES": set(),
-        "STES_AE": {"abs"},
-        "STES_SE": {"sq"},
-        "STES_EAE": {"raw", "abs"},
-        "STES_ESE": {"raw", "sq"},
-        "STES_AESE": {"abs", "sq"},
-        "STES_EAESE": {"raw", "abs", "sq"},
-    }[variant]
-
-    cols = []
-    for c in X.columns:
-        if c == "const":
-            continue
-        g = _infer_feature_group(c)
-        if g in groups_needed:
-            cols.append(c)
-
-    if variant == "ES":
-        return ["const"] if "const" in X.columns else []
-
-    if "const" in X.columns:
-        cols = ["const"] + cols
-    return cols
 
 
 def _fit_variant_rmse(variant: str, X: pd.DataFrame, y: pd.Series, r: pd.Series) -> float:
@@ -315,7 +271,7 @@ def _fit_variant_rmse(variant: str, X: pd.DataFrame, y: pd.Series, r: pd.Series)
     if len(y) <= OS_INDEX:
         raise ValueError(f"Insufficient rows for slicing: len(y)={len(y)}")
 
-    cols = _select_variant_columns(X, variant)
+    cols = select_variant_columns(X, variant)
     if not cols:
         cols = ["const"]
 
@@ -511,7 +467,7 @@ def _fit_spy_variant(
     r: pd.Series,
 ):
     """Fit a SPY variant and return model, forecasts, slices, and columns."""
-    cols = _select_variant_columns(X, variant)
+    cols = select_variant_columns(X, variant)
     if not cols:
         cols = ["const"]
     X_sel = X[cols]
@@ -680,60 +636,60 @@ def _plot_gate_panel(
     """2x2 panel: alpha, alpha hist, alpha vs |r|, and D_t vs |r|."""
     _ensure_dir(out_dir)
 
-    # Align to t-1 inputs
-    alpha_lag = alpha_t.shift(1)
-    r_lag = r.shift(1)
+    # Here, alpha_t and r_t are contemporaneous with the forecast made at time t (about t+1).
+    alpha_now = alpha_t
+    r_now = r
 
     # Align to common index
-    idx = alpha_lag.index.intersection(r_lag.index)
+    idx = alpha_now.index.intersection(r_now.index)
     if D_t is not None:
         idx = idx.intersection(D_t.index)
 
-    alpha_lag = alpha_lag.reindex(idx)
-    r_lag = r_lag.reindex(idx)
+    alpha_now = alpha_now.reindex(idx)
+    r_now = r_now.reindex(idx)
     if D_t is not None:
         D_t = D_t.reindex(idx)
 
     df = pd.DataFrame(
         {
-            "alpha_lag": alpha_lag,
-            "r_lag": r_lag,
+            "alpha": alpha_now,
+            "r": r_now,
         },
         index=idx,
     )
-    df["abs_r_lag"] = df["r_lag"].abs()
+    df["abs_r"] = df["r"].abs()
 
     if D_t is not None:
         df["D_t"] = D_t
 
-    df = df.dropna(subset=["alpha_lag", "r_lag", "abs_r_lag"])
+    df = df.dropna(subset=["alpha", "r", "abs_r"])
 
     fig, axes = plt.subplots(2, 2, figsize=(12, 7))
     ax00, ax01 = axes[0, 0], axes[0, 1]
     ax10, ax11 = axes[1, 0], axes[1, 1]
 
-    ax00.plot(df.index, df["alpha_lag"].values, lw=1.0)
-    ax00.set_title(f"{title_prefix}: $\\alpha_{{t-1}}$ time series")
-    ax00.set_ylabel("$\\alpha_{t-1}$")
+    ax00.plot(df.index, df["alpha"].values, lw=1.0)
+    ax00.set_title(f"{title_prefix}: $\\alpha_t$ time series")
+    ax00.set_ylabel("$\\alpha_t$")
     ax00.set_xlabel("date")
     ax00.grid(True, alpha=0.25)
 
-    ax01.hist(df["alpha_lag"].values, bins=50, alpha=0.9)
-    ax01.set_title(f"{title_prefix}: distribution of $\\alpha_{{t-1}}$")
-    ax01.set_xlabel("$\\alpha_{t-1}$")
+    ax01.hist(df["alpha"].values, bins=50, alpha=0.9)
+    ax01.set_title(f"{title_prefix}: distribution of $\\alpha_t$")
+    ax01.set_xlabel("$\\alpha_t$")
     ax01.set_ylabel("count")
     ax01.grid(True, alpha=0.25)
 
     try:
-        tmp = df[["alpha_lag", "abs_r_lag"]].copy()
-        tmp["bin"] = pd.qcut(tmp["abs_r_lag"], q=q_bins, duplicates="drop")
-        grp = tmp.groupby("bin", observed=True)["alpha_lag"].mean()
+        tmp = df[["alpha", "abs_r"]].copy()
+        tmp["bin"] = pd.qcut(tmp["abs_r"], q=q_bins, duplicates="drop")
+        grp = tmp.groupby("bin", observed=True)["alpha"].mean()
         ax10.plot(np.arange(len(grp)), grp.values, marker="o", lw=1.5)
         ax10.set_title(
-            f"{title_prefix}: binned mean $\\alpha_{{t-1}}$ vs $|r_{{t-1}}|$ quantiles"
+            f"{title_prefix}: binned mean $\\alpha_t$ vs $|r_t|$ quantiles"
         )
-        ax10.set_xlabel("quantile bin of $|r_{t-1}|$ (low → high)")
-        ax10.set_ylabel("mean $\\alpha_{t-1}$")
+        ax10.set_xlabel("quantile bin of $|r_t|$ (low → high)")
+        ax10.set_ylabel("mean $\\alpha_t$")
         ax10.grid(True, alpha=0.25)
     except Exception as e:
         ax10.text(
@@ -747,15 +703,15 @@ def _plot_gate_panel(
 
     if D_t is not None and "D_t" in df.columns:
         try:
-            tmp = df[["D_t", "abs_r_lag"]].dropna().copy()
-            tmp["bin"] = pd.qcut(tmp["abs_r_lag"], q=q_bins, duplicates="drop")
+            tmp = df[["D_t", "abs_r"]].dropna().copy()
+            tmp["bin"] = pd.qcut(tmp["abs_r"], q=q_bins, duplicates="drop")
             grp = tmp.groupby("bin", observed=True)["D_t"].mean()
             ax11.plot(np.arange(len(grp)), grp.values, marker="o", lw=1.5)
             ax11.axhline(0.0, lw=1.0)
             ax11.set_title(
-                "Binned mean $D_t$ vs $|r_{t-1}|$ quantiles\n($D_t>0$ means STES better than ES)"
+                "Binned mean $D_t$ vs $|r_t|$ quantiles\n($D_t>0$ means STES better than ES)"
             )
-            ax11.set_xlabel("quantile bin of $|r_{t-1}|$ (low → high)")
+            ax11.set_xlabel("quantile bin of $|r_t|$ (low → high)")
             ax11.set_ylabel("mean $D_t$")
             ax11.grid(True, alpha=0.25)
         except Exception as e:
@@ -853,9 +809,8 @@ def analyze_spy_stes(
     df["r"] = rr.values
     df["abs_r"] = np.abs(df["r"].values)
     df["r2"] = df["r"].values ** 2
-    df["r2_lag"] = pd.Series(df["r2"], index=idx).shift(1).values
 
-    # Alpha on full X, then lag to align with forecasts
+    # Alpha on full X, aligned contemporaneously (alpha_t for forecast at t)
     X_full_stes = X[best_cols]
     alpha_full = _compute_alpha(
         best_model, X_full_stes
@@ -866,18 +821,20 @@ def analyze_spy_stes(
         alpha_full=alpha_full,
         strict=_strict_gate_check_on(),
     )
-    df["alpha_stes_lag"] = alpha_full.shift(1).reindex(idx).values
+    df["alpha_stes"] = alpha_full.reindex(idx).values
 
     # ES constant alpha
     alpha_es_prob = model_es.alpha_
     assert 0.0 < alpha_es_prob < 1.0, f"ES alpha_ must be in (0,1), got {alpha_es_prob}"
     df["alpha_es"] = alpha_es_prob
 
-    df["delta_alpha"] = df["alpha_stes_lag"] - df["alpha_es"]
+    df["delta_alpha"] = df["alpha_stes"] - df["alpha_es"]
 
-    # Innovation proxy using ES state
-    df["yhat_es_lag"] = pd.Series(df["yhat_es"], index=idx).shift(1).values
-    df["u_lag"] = df["r2_lag"] - df["yhat_es_lag"]
+    # ES state proxy: the variance level v_t is the *previous* forecast made at t-1.
+    df["v_es_state"] = pd.Series(df["yhat_es"], index=idx).shift(1).values
+
+    # Innovation proxy at time t: u_t = r_t^2 - v_t^{ES}
+    df["u"] = df["r2"] - df["v_es_state"]
 
     # Range checks
     if alpha_full.dropna().size > 0:
@@ -933,8 +890,8 @@ def analyze_spy_stes(
 
     # Score contributions
     contrib = X_aligned.mul(beta, axis=1).add_prefix("c_")
-    contrib_lag = contrib.shift(1).reindex(df.index)
-    df = df.join(contrib_lag)
+    contrib_now = contrib.reindex(df.index)
+    df = df.join(contrib_now)
 
     # Summary tables
     def _summ(mask):
@@ -944,14 +901,14 @@ def analyze_spy_stes(
             "mean_D": float(sub["D"].mean()),
             "mean_loss_es": float(sub["loss_es"].mean()),
             "mean_loss_stes": float(sub["loss_stes"].mean()),
-            "mean_alpha_stes": float(sub["alpha_stes_lag"].mean()),
+            "mean_alpha_stes": float(sub["alpha_stes"].mean()),
             "mean_alpha_es": float(sub["alpha_es"].mean()),
             "mean_delta_alpha": float(sub["delta_alpha"].mean()),
             "frac_delta_alpha_pos": float((sub["delta_alpha"] > 0).mean()),
-            "mean_u_lag": float(sub["u_lag"].mean()),
-            "frac_u_pos": float((sub["u_lag"] > 0).mean()),
+            "mean_u": float(sub["u"].mean()),
+            "frac_u_pos": float((sub["u"] > 0).mean()),
             "mean_abs_r": float(sub["abs_r"].mean()),
-            "mean_r2_lag": float(sub["r2_lag"].mean()),
+            # mean_r2_lag is omitted, as r2_lag is no longer defined in this convention
         }
         ccols = [c for c in sub.columns if c.startswith("c_")]
         out["mean_contrib"] = sub[ccols].mean().sort_values(ascending=False)
@@ -1010,9 +967,9 @@ def analyze_spy_stes(
     )
 
     paths_alpha = {
-        "alpha_STES (wins)": _event_window_mean(df["alpha_stes_lag"], win_idx, window),
+        "alpha_STES (wins)": _event_window_mean(df["alpha_stes"], win_idx, window),
         "alpha_STES (losses)": _event_window_mean(
-            df["alpha_stes_lag"], lose_idx, window
+            df["alpha_stes"], lose_idx, window
         ),
         "alpha_ES (const)": pd.Series(
             [df["alpha_es"].iloc[0]] * (2 * window + 1),
@@ -1021,10 +978,10 @@ def analyze_spy_stes(
     }
     _plot_event_paths(
         paths_alpha,
-        r"Event study: gate $\alpha_{t-1}$ (used in forecast for date $t$) around WIN vs LOSE dates",
+        r"Event study: gate $\alpha_t$ (used in forecast for date $t+1$) around WIN vs LOSE dates",
         out_dir,
         "spy_event_alpha.png",
-        ylabel=r"mean $\alpha_{t+k-1}$",
+        ylabel=r"mean $\alpha_{t+k}$",
         note=event_def,
     )
 
@@ -1042,15 +999,15 @@ def analyze_spy_stes(
     )
 
     paths_u = {
-        "u_{t-1} (wins)": _event_window_mean(df["u_lag"], win_idx, window),
-        "u_{t-1} (losses)": _event_window_mean(df["u_lag"], lose_idx, window),
+        "u_t (wins)": _event_window_mean(df["u"], win_idx, window),
+        "u_t (losses)": _event_window_mean(df["u"], lose_idx, window),
     }
     _plot_event_paths(
         paths_u,
-        r"Event study: innovation proxy $u_{t-1}=r_{t-1}^2-\hat v_{t-1}^{ES}$ around WIN vs LOSE dates",
+        r"Event study: innovation proxy $u_t=r_t^2-\hat v_t^{ES}$ around WIN vs LOSE dates",
         out_dir,
         "spy_event_u.png",
-        ylabel=r"mean $u_{t+k-1}$ (so at k=0 this is $u_{t-1}$)",
+        ylabel=r"mean $u_{t+k}$ (so at k=0 this is $u_t$)",
         note=event_def,
     )
 
@@ -1066,7 +1023,7 @@ def analyze_spy_stes(
 
     fig, ax = plt.subplots(figsize=(9, 4))
     ax.scatter(
-        df["u_lag"].values,
+        df["u"].values,
         df["delta_alpha"].values,
         s=6,
         alpha=0.15,
@@ -1074,7 +1031,7 @@ def analyze_spy_stes(
         color="#999999",
     )
     ax.scatter(
-        df.loc[win_idx, "u_lag"].values,
+        df.loc[win_idx, "u"].values,
         df.loc[win_idx, "delta_alpha"].values,
         s=10,
         alpha=0.35,
@@ -1082,7 +1039,7 @@ def analyze_spy_stes(
         color="#2ca02c",
     )
     ax.scatter(
-        df.loc[lose_idx, "u_lag"].values,
+        df.loc[lose_idx, "u"].values,
         df.loc[lose_idx, "delta_alpha"].values,
         s=10,
         alpha=0.35,
@@ -1092,11 +1049,11 @@ def analyze_spy_stes(
     ax.axhline(0.0, lw=1.0)
     ax.axvline(0.0, lw=1.0)
     ax.set_title(
-        r"Mechanism view: $\Delta\alpha_{t-1}=\alpha^{STES}_{t-1}-\alpha^{ES}$ vs $u_{t-1}$"
+        r"Mechanism view: $\Delta\alpha_t=\alpha^{STES}_t-\alpha^{ES}$ vs $u_t$"
         + f"\n(WIN/LOSE are top/bottom {int(q*100)}% of D_t in the OOS sample)"
     )
-    ax.set_xlabel("$u_{t-1}=r_{t-1}^2-\\hat v_{t-1}^{ES}$")
-    ax.set_ylabel("$\\Delta\\alpha_{t-1}=\\alpha^{STES}_{t-1}-\\alpha^{ES}$")
+    ax.set_xlabel("$u_t=r_t^2-\\hat v_t^{ES}$")
+    ax.set_ylabel("$\\Delta\\alpha_t=\\alpha^{STES}_t-\\alpha^{ES}$")
     ax.grid(True, alpha=0.25)
     ax.legend(loc="best")
     fig.tight_layout()
@@ -1147,7 +1104,7 @@ def main():
         # Build wide dataset ONCE for this run
         spec = _build_sim_spec(N_LAGS)
         try:
-            X_wide, y, r, _ = _build_wide_data(ctx, spec)
+            X_wide, y, r, _ = build_wide_dataset(ctx, spec)
             if i == 1:
                 # Report IS/OOS date ranges once
                 idx = X_wide.index
@@ -1211,7 +1168,7 @@ def main():
 
     try:
         spy_spec = _build_spy_spec(N_LAGS)
-        X, y, r, _ = _build_wide_data(ctx, spy_spec, entity_id=SPY_TICKER)
+        X, y, r, _ = build_wide_dataset(ctx, spy_spec, entity_id=SPY_TICKER)
     except Exception as e:
         logger.warning(
             "SPY via Tiingo failed. Ensure TIINGO_API_KEY is set in .env and valid.\n"
@@ -1222,7 +1179,7 @@ def main():
         for variant in VARIANTS:
             for seed in range(SPY_N_INITS):
                 try:
-                    cols = _select_variant_columns(X, variant)
+                    cols = select_variant_columns(X, variant)
                     if not cols:
                         cols = ["const"]
                     X_sel = X[cols]
@@ -1358,8 +1315,8 @@ def main():
         # Simulated data
         _attach_sim_source(ctx, 12345)
         spec_sim = _build_sim_spec(N_LAGS)
-        X_sim, y_sim, r_sim, _ = _build_wide_data(ctx, spec_sim)
-        cols_sim = _select_variant_columns(X_sim, "STES_EAESE")
+        X_sim, y_sim, r_sim, _ = build_wide_dataset(ctx, spec_sim)
+        cols_sim = select_variant_columns(X_sim, "STES_EAESE")
         if not cols_sim:
             cols_sim = ["const"]
         Xsim_sel = X_sim[cols_sim].iloc[IS_INDEX:OS_INDEX]
@@ -1375,7 +1332,7 @@ def main():
 
         # SPY data
         if X is not None and len(y) > SPY_OS_INDEX:
-            cols_spy = _select_variant_columns(X, "STES_EAESE")
+            cols_spy = select_variant_columns(X, "STES_EAESE")
             if not cols_spy:
                 cols_spy = ["const"]
             Xspy_sel = X[cols_spy].iloc[SPY_IS_INDEX:SPY_OS_INDEX]
