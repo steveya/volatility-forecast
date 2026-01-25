@@ -1,48 +1,47 @@
-"""
-XGBoost-STES model: a tree-ensemble transition function inside an EWMA / STES-style variance filter.
-
-This module implements a hybrid model with the *mathematically natural* STES recursion
-
-    v_{t+1} = v_t + α_t (r_t^2 - v_t)
-    α_t = expit( F(X_t) )
-
-where:
-- X_t contains information available at time t (end of day t for daily data)
-- r_t is the return over (t-1, t]
-- the forecast made at time t for the next period is v_{t+1|t}
-
-- The dataset row indexed by time t stores:
-    - features X_t
-    - contemporaneous return r_t (for the recursion update)
-    - label y_t := r_{t+1}^2 (next-day squared return) aligned to time t
-- During training and evaluation, we compare y_t against the forecast made at time t:
-
-    ŷ_t = v_{t+1|t}
-
-`predict()` returns a time series aligned to X.index where element t is the model's
-one-step-ahead variance forecast *made at t*.
-
-Training uses the alternating supervised scheme (stable EM-like loop):
-- Given a current α_t path, compute the state v_t and forecasts ŷ_t.
-- Holding v_t fixed, compute the one-step optimal α*_t for each t:
-
-    α*_t = argmin_{α in [0,1]} ( y_t - (v_t + α (r_t^2 - v_t)) )^2
-         = clip( (y_t - v_t) / (r_t^2 - v_t), 0, 1 )
-
-- Fit XGBoost to predict logit(α*_t) from X_t.
-- Repeat for a few outer iterations, warm-starting the booster each time.
-
-"""
-
 from __future__ import annotations
 
+"""Tree-gated STES (XGBoostSTESModel).
+
+This module contains a single model class, :class:`XGBoostSTESModel`, that combines
+
+- a **variance recursion** (EWMA/STES-style filter)
+
+    v_{t+1} = v_t + α_t (r_t^2 - v_t)
+
+- a **gate model** for α_t.
+
+Two fitting routes are supported:
+
+1) ``fit_method='alternating'``
+   Alternating supervision on a per-step pseudo-optimal gate α*_t, where α*_t is
+   defined as the minimiser (over α∈[0,1]) of the one-step forecast loss while
+   holding v_t fixed.
+
+2) ``fit_method='end_to_end'``
+   End-to-end optimisation of the variance forecast loss through the recursion,
+   using an adjoint pass to produce gradients and a stable diagonal Gauss–Newton
+   approximation for Hessians.
+
+Notes on data alignment
+-----------------------
+We treat each row t as:
+  - state before update: v_t
+  - innovation available at t: r_t^2
+  - gate decided at t: alpha_t
+  - forecast made at t: yhat_t = v_{t+1|t} = v_t + alpha_t (r_t^2 - v_t)
+
+So training labels y[t] should correspond to the realised variance for the next step
+being forecast at time t (commonly: y_t = r_{t+1}^2).
+"""
+
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+import logging
+from typing import Any, Dict, Iterable, Literal, Optional, Sequence, Tuple, List
 
 import numpy as np
 import pandas as pd
-
-from scipy.special import expit, logit
+from scipy.special import expit
+from sklearn.model_selection import TimeSeriesSplit
 
 try:
     import xgboost as xgb
@@ -51,22 +50,40 @@ except Exception:  # pragma: no cover
 
 from .base_model import BaseVolatilityModel
 
+logger = logging.getLogger(__name__)
 
-@dataclass
-class XGBSTESFitResult:
+FitMethod = Literal["alternating", "end_to_end"]
+LossName = Literal["mse", "pseudohuber"]
+OutputMode = Literal["alpha", "logit"]
+
+
+@dataclass(frozen=True, slots=True)
+class FitResultBase:
     booster: Any
     params_used: Dict[str, Any]
     num_boost_round: int
-    n_alt_iters: int
-    feature_names: list[str]
+    feature_names: Tuple[str, ...]
     alpha_base: float
+    fit_method: FitMethod
+    output_mode: OutputMode
+
+
+@dataclass(frozen=True, slots=True)
+class AlternatingFitResult(FitResultBase):
+    n_alt_iters: int
+    gate_valid_frac: float
+    loss: LossName
+    huber_delta: float
+
+
+@dataclass(frozen=True, slots=True)
+class EndToEndFitResult(FitResultBase):
+    loss: LossName
+    huber_delta: float
 
 
 class XGBoostSTESModel(BaseVolatilityModel):
-    """
-    XGBoost-based STES gate trained with the alternating 
-    supervised loop.
-    """
+    """XGBoost-gated STES volatility model."""
 
     def __init__(
         self,
@@ -74,35 +91,68 @@ class XGBoostSTESModel(BaseVolatilityModel):
         xgb_params: Optional[Dict[str, Any]] = None,
         num_boost_round: int = 200,
         init_window: int = 500,
+        # fitting mode
+        fit_method: FitMethod = "alternating",
+        # shared loss (used for α* (alternating) and end-to-end objective)
+        loss: LossName = "mse",
+        huber_delta: float = 1.0,
+        # end-to-end diagnostics / numerics
+        e2e_grad_hess_scale: float = 1.0,
+        e2e_debug: bool = False,
+        e2e_debug_print_once: bool = True,
+        # alternating-specific knobs
         n_alt_iters: int = 3,
-        alt_clip_eps: float = 1e-6,
+        gate_valid_frac: float = 0.10,
+        # misc
         random_state: Optional[int] = None,
         monotonic_constraints: Optional[dict[str, int]] = None,
-        alt_objective: str = "reg:pseudohubererror",
-        residual_mode: bool = True,
-        denom_quantile: float = 0.05,
-        min_denom_floor: float = 1e-12,
+        **kwargs: Any,
     ) -> None:
         super().__init__()
-        self.xgb_params = dict(xgb_params or {})
+
+        if kwargs:
+            # Backward-compat: ignore removed constructor knobs (priors, logit-target modes, etc.)
+            logger.warning(
+                "Ignoring unsupported XGBoostSTESModel __init__ kwargs: %s",
+                sorted(list(kwargs.keys())),
+            )
+
+        if fit_method not in {"alternating", "end_to_end"}:
+            raise ValueError("fit_method must be one of: {'alternating','end_to_end'}")
+        if loss not in {"mse", "pseudohuber"}:
+            raise ValueError("loss must be one of: {'mse','pseudohuber'}")
+        if not (np.isfinite(huber_delta) and huber_delta > 0.0):
+            raise ValueError("huber_delta must be finite and > 0")
+        if not (np.isfinite(e2e_grad_hess_scale) and e2e_grad_hess_scale > 0.0):
+            raise ValueError("e2e_grad_hess_scale must be finite and > 0")
+
+        self.xgb_params: Dict[str, Any] = dict(xgb_params or {})
         self.num_boost_round = int(num_boost_round)
         self.init_window = int(init_window)
+        self.fit_method: FitMethod = fit_method
+
+        self.loss: LossName = loss
+        self.huber_delta = float(huber_delta)
+
+        self.e2e_grad_hess_scale = float(e2e_grad_hess_scale)
+        self.e2e_debug = bool(e2e_debug)
+        self.e2e_debug_print_once = bool(e2e_debug_print_once)
+
         self.n_alt_iters = int(n_alt_iters)
-        self.alt_clip_eps = float(alt_clip_eps)
+        self.gate_valid_frac = float(gate_valid_frac)
+
         self.random_state = random_state
+        self.monotonic_constraints: dict[str, int] = monotonic_constraints or {}
 
-        self.monotonic_constraints = monotonic_constraints
-        self.alt_objective = alt_objective
-        self.residual_mode = residual_mode
-        self.denom_quantile = denom_quantile
-        self.min_denom_floor = min_denom_floor
-        self.base_margin_: Optional[float] = None
-
-        self.model_: Optional[Any] = None
-        self.fit_result_: Optional[XGBSTESFitResult] = None
+        # learned artifacts
+        self.model_: Any = None
+        self.fit_result_: Optional[FitResultBase] = None
+        self.output_mode_: Optional[OutputMode] = None
+        self.init_var_: Optional[float] = None
+        self.last_var_: Optional[float] = None
 
     # ---------------------------------------------------------------------
-    # Helpers
+    # small utilities
     # ---------------------------------------------------------------------
     @staticmethod
     def _check_xgb() -> None:
@@ -113,38 +163,41 @@ class XGBoostSTESModel(BaseVolatilityModel):
 
     @staticmethod
     def _as_numpy(X: pd.DataFrame) -> np.ndarray:
-        # Ensure stable column order and dtype (float) for xgboost.
-        return np.asarray(X.values, dtype=float)
+        return np.asarray(X.values, dtype=float, order="C")
 
     @staticmethod
     def _initial_variance(returns2: np.ndarray, init_window: int) -> float:
-        w = min(int(init_window), int(len(returns2)))
-        if w <= 0:
-            return float("nan")
-        return float(np.mean(returns2[:w]))
+        w = int(max(1, init_window))
+        arr = np.asarray(returns2, dtype=float)
+        if arr.size == 0:
+            return 1e-8
+        head = arr[: min(w, arr.size)]
+        v0 = float(np.nanmean(head))
+        return v0 if np.isfinite(v0) and v0 > 0.0 else 1e-8
 
     @staticmethod
     def _apply_monotone_constraints(
-        params: Dict[str, Any], feature_names: list[str], constraints: dict[str, int]
+        params: Dict[str, Any],
+        feature_names: Sequence[str],
+        constraints: dict[str, int],
     ) -> None:
-        """Apply XGBoost monotone constraints in the correct column order."""
         if not constraints:
             return
-        ordered = [str(int(constraints.get(c, 0))) for c in feature_names]
-        # XGBoost expects a string like "(1,0,-1,...)"
-        params["monotone_constraints"] = "(" + ",".join(ordered) + ")"
+        cons = [0] * len(feature_names)
+        name_to_idx = {n: i for i, n in enumerate(feature_names)}
+        for k, v in constraints.items():
+            if k in name_to_idx:
+                cons[name_to_idx[k]] = int(v)
+        params["monotone_constraints"] = tuple(cons)
 
+    # ---------------------------------------------------------------------
+    # recursion + loss helpers
+    # ---------------------------------------------------------------------
     @staticmethod
     def _filter_state_and_forecast(
         returns2: np.ndarray, alpha: np.ndarray, init_var: float
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Run the STES recursion with *row-aligned* alpha.
-
-        We treat each row t as:
-          - state before update: v_t
-          - innovation available at t: r_t^2
-          - gate decided at t: alpha_t
-          - forecast made at t: yhat_t = v_{t+1|t} = v_t + alpha_t (r_t^2 - v_t)
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Run v_{t+1} = v_t + α_t (r_t^2 - v_t).
 
         Returns
         -------
@@ -156,31 +209,112 @@ class XGBoostSTESModel(BaseVolatilityModel):
         n = int(len(returns2))
         v_state = np.empty(n, dtype=float)
         yhat = np.empty(n, dtype=float)
-
         v = float(init_var)
         for t in range(n):
             v_state[t] = v
-            a = float(alpha[t])
-            v_next = v + a * (float(returns2[t]) - v)
-            yhat[t] = v_next
-            v = v_next
+            v = v + float(alpha[t]) * (float(returns2[t]) - v)
+            yhat[t] = v
         return v_state, yhat
 
     @staticmethod
-    def _compute_alpha_star(
-        *, y: np.ndarray, returns2: np.ndarray, v_state: np.ndarray, alpha_fallback: float
+    def _loss_derivs(
+        yhat: np.ndarray,
+        y: np.ndarray,
+        *,
+        loss: LossName,
+        huber_delta: float,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Return elementwise (e, w) where:
+
+        - e = dℓ/dyhat
+        - w = d²ℓ/dyhat²
+
+        Conventions:
+        - For MSE we use ℓ(u) = 0.5 * u^2, so e=u and w=1.
+        - For pseudo-Huber we use ℓ(u) = δ^2 * (sqrt(1 + (u/δ)^2) - 1).
+        """
+        u = (yhat - y).astype(float)
+        if loss == "mse":
+            return u, np.ones_like(u, dtype=float)
+        d = float(huber_delta)
+        s = np.sqrt(1.0 + (u / d) ** 2)
+        e = u / s
+        w = 1.0 / (s**3)
+        return e, w
+
+    @staticmethod
+    def _loss_value(
+        yhat: np.ndarray, y: np.ndarray, *, loss: LossName, huber_delta: float
+    ) -> float:
+        u = (yhat - y).astype(float)
+        if loss == "mse":
+            # Keep reporting consistent with _loss_derivs convention:
+            # ℓ(u) = 0.5 * u^2  =>  dℓ/du = u, d²ℓ/du² = 1
+            return float(0.5 * np.mean(u * u))
+        d = float(huber_delta)
+        return float(np.mean(d * d * (np.sqrt(1.0 + (u / d) ** 2) - 1.0)))
+
+    def _alpha_star_for_loss(
+        self,
+        *,
+        y: np.ndarray,
+        returns2: np.ndarray,
+        v_state: np.ndarray,
+        alpha_fallback: float,
+        max_iter: int = 15,
+        tol: float = 1e-10,
     ) -> np.ndarray:
-        """Compute pseudo-optimal alpha*_t holding v_t fixed (one-step)."""
+        """Compute α*_t in [0,1] minimising one-step loss holding v_t fixed.
+
+        For MSE we have a closed form:
+            α* = clip((y - v)/(r^2 - v), 0, 1).
+
+        For pseudo-Huber we do a small, robust Newton solve in α (per time step),
+        using the shared loss derivatives.
+        """
         n = int(len(y))
         out = np.full(n, float(alpha_fallback), dtype=float)
+        eps = 1e-12
 
         for t in range(n):
-            denom = float(returns2[t] - v_state[t])
-            if (not np.isfinite(denom)) or abs(denom) < 1e-12:
-                a = float(alpha_fallback)
-            else:
-                a = float((y[t] - v_state[t]) / denom)
-            out[t] = float(np.clip(a, 0.0, 1.0))
+            v = float(v_state[t])
+            denom = float(returns2[t] - v)
+            if (not np.isfinite(denom)) or abs(denom) < eps:
+                out[t] = float(alpha_fallback)
+                continue
+
+            # MSE closed-form init (also good init for Huber)
+            a = float((y[t] - v) / denom)
+            a = float(np.clip(a, 0.0, 1.0))
+
+            if self.loss == "mse":
+                out[t] = a
+                continue
+
+            # pseudo-Huber: minimise ℓ(yhat(α), y), yhat = v + α*denom.
+            # dℓ/dα = (dℓ/dyhat) * denom
+            # d²ℓ/dα² = (d²ℓ/dyhat²) * denom²
+            for _ in range(int(max_iter)):
+                yhat = v + a * denom
+                e, w = self._loss_derivs(
+                    np.asarray([yhat]),
+                    np.asarray([y[t]]),
+                    loss=self.loss,
+                    huber_delta=self.huber_delta,
+                )
+                g = float(e[0]) * denom
+                h = float(w[0]) * (denom * denom)
+                if not (np.isfinite(g) and np.isfinite(h)) or h <= 0.0:
+                    break
+                step = g / h
+                a_new = float(np.clip(a - step, 0.0, 1.0))
+                if abs(a_new - a) < tol:
+                    a = a_new
+                    break
+                a = a_new
+
+            out[t] = a
+
         return out
 
     # ---------------------------------------------------------------------
@@ -194,42 +328,43 @@ class XGBoostSTESModel(BaseVolatilityModel):
         returns: pd.Series,
         start_index: int = 0,
         end_index: Optional[int] = None,
-        **kwargs: Any,
+        # New CV arguments
+        perform_cv: bool = False,
+        cv_grid: Optional[Iterable[Dict[str, Any]]] = None,
+        cv_splits: int = 5,
+        **_: Any,
     ) -> "XGBoostSTESModel":
-        """Fit on a contiguous time block [start_index:end_index).
-
-        Expected alignment:
-        - X[t] is info at time t
-        - returns[t] is r_t (realized over (t-1,t])
-        - y[t] is r_{t+1}^2 (next-day squared return) aligned to time t
-        """
         self._check_xgb()
-
         if end_index is None:
             end_index = len(y)
+
+        # Sanity check for CV
+        if perform_cv:
+            if cv_grid is None:
+                raise ValueError("If perform_cv=True, you must provide a cv_grid.")
+            # Ensure sklearn is available before starting heavy work
+            try:
+                import sklearn.model_selection  # noqa
+            except ImportError:
+                raise ImportError("scikit-learn is required for CV.")
 
         X_fit = X.iloc[start_index:end_index].copy()
         y_fit = y.iloc[start_index:end_index].copy()
         r_fit = returns.iloc[start_index:end_index].copy()
 
-        # Strict alignment (defensive)
         idx = X_fit.index.intersection(y_fit.index).intersection(r_fit.index)
         X_fit = X_fit.loc[idx]
         y_fit = y_fit.loc[idx]
         r_fit = r_fit.loc[idx]
-
         if len(X_fit) < 10:
             raise ValueError("Not enough rows to fit XGBoostSTESModel.")
 
         X_np = self._as_numpy(X_fit)
         y_np = np.asarray(y_fit.values, dtype=float)
         returns2_np = np.asarray(r_fit.values, dtype=float) ** 2
-
         init_var = self._initial_variance(returns2_np, self.init_window)
 
-        # Default XGBoost params (can be overridden)
         params = dict(self.xgb_params)
-        params.setdefault("objective", self.alt_objective)
         params.setdefault("max_depth", 3)
         params.setdefault("eta", 0.05)
         params.setdefault("subsample", 1.0)
@@ -240,46 +375,127 @@ class XGBoostSTESModel(BaseVolatilityModel):
         if self.random_state is not None:
             params.setdefault("seed", int(self.random_state))
 
-        feature_names = list(X_fit.columns)
-        self._apply_monotone_constraints(params, feature_names, self.monotonic_constraints or {})
+        feature_names = tuple(X_fit.columns)
+        self._apply_monotone_constraints(
+            params, feature_names, self.monotonic_constraints
+        )
 
-        # Baseline alpha for fallback/initialization: try ES alpha if available.
+        # -----------------------------------------------------------------
+        # AUTO-TUNING BLOCK
+        # -----------------------------------------------------------------
+        if perform_cv and cv_grid is not None:
+            logger.info(
+                f"Running auto-tuning ({self.fit_method}) with {cv_splits} splits..."
+            )
+
+            # 1. Dispatch to the correct CV method
+            if self.fit_method == "end_to_end":
+                # Relies on the run_cv method added in previous step
+                cv_results = self.run_cv_e2e(
+                    X_fit, y_fit, returns=r_fit, param_grid=cv_grid, n_splits=cv_splits
+                )
+            else:
+                # Relies on the run_cv_alternating method added in previous step
+                cv_results = self.run_cv_alternating(
+                    X_fit, y_fit, returns=r_fit, param_grid=cv_grid, n_splits=cv_splits
+                )
+
+            # 2. Pick winner (results are sorted by score ascending, so index 0 is best)
+            best_score, best_params = cv_results[0]
+            logger.info(f"Auto-tuning complete. Best Score: {best_score:.6f}")
+            logger.info(f"Best Params: {best_params}")
+
+            # 3. Update the params dict that will be used for the final fit below
+            params.update(best_params)
+            # Optional: Update the class state so user sees what was chosen
+            self.xgb_params.update(best_params)
+
+        # baseline alpha for init (best-effort)
         alpha_base = 0.06
         try:
-            from .es_model import ESModel  # type: ignore
+            from .es_model import ESModel
 
             m = ESModel(random_state=self.random_state)
             m.fit(X_fit, y_fit, returns=r_fit, start_index=0, end_index=len(X_fit))
             alpha_base = float(getattr(m, "alpha_", alpha_base))
         except Exception:
-            pass
+            logger.warning("ESModel fit failed; using default alpha_base=0.06.")
 
-        # Store base margin for residual learning
-        base = logit(np.clip(alpha_base, 1e-6, 1.0 - 1e-6))
-        self.base_margin_ = float(base)
+        if self.fit_method == "alternating":
+            params.setdefault(
+                "objective",
+                "reg:logistic" if self.loss == "mse" else "reg:pseudohubererror",
+            )
+            booster = self._fit_alternating(
+                X_np=X_np,
+                y_np=y_np,
+                returns2_np=returns2_np,
+                init_var=init_var,
+                params=params,
+                alpha_base=alpha_base,
+                feature_names=feature_names,
+            )
+            self.output_mode_ = "alpha"
+            self.fit_result_ = AlternatingFitResult(
+                booster=booster,
+                params_used=params,
+                num_boost_round=self.num_boost_round,
+                feature_names=feature_names,
+                alpha_base=float(alpha_base),
+                fit_method="alternating",
+                output_mode="alpha",
+                n_alt_iters=int(self.n_alt_iters),
+                gate_valid_frac=float(self.gate_valid_frac),
+                loss=self.loss,
+                huber_delta=float(self.huber_delta),
+            )
+        else:
+            params.setdefault("objective", "reg:squarederror")  # ignored by custom obj
+            params["min_child_weight"] = 1e-8
+            params["reg_lambda"] = 1e-8
+            params["max_depth"] = 2
+            params["eta"] = 0.1
+            params["subsample"] = 1
+            params["colsample_bytree"] = 1
 
-        booster = self._fit_alternating_supervised(
-            X_np=X_np,
-            y_np=y_np,
-            returns2_np=returns2_np,
-            init_var=init_var,
-            params=params,
-            alpha_base=alpha_base,
-            feature_names=feature_names,
+            booster = self._fit_end_to_end(
+                X_np=X_np,
+                y_np=y_np,
+                returns2_np=returns2_np,
+                init_var=init_var,
+                params=params,
+                feature_names=feature_names,
+            )
+            self.output_mode_ = "logit"
+            self.fit_result_ = EndToEndFitResult(
+                booster=booster,
+                params_used=params,
+                num_boost_round=self.num_boost_round,
+                feature_names=feature_names,
+                alpha_base=float(alpha_base),
+                fit_method="end_to_end",
+                output_mode="logit",
+                loss=self.loss,
+                huber_delta=float(self.huber_delta),
+            )
+
+        self.model_ = self.fit_result_.booster
+
+        # store warm-start terminal variance on the fit block
+        d_all = xgb.DMatrix(X_np, feature_names=list(feature_names))
+        score = self.model_.predict(d_all)
+        alpha_fit = (
+            expit(score.astype(float))
+            if self.output_mode_ == "logit"
+            else np.clip(score.astype(float), 0.0, 1.0)
         )
 
-        self.model_ = booster
-        self.fit_result_ = XGBSTESFitResult(
-            booster=booster,
-            params_used=params,
-            num_boost_round=self.num_boost_round,
-            n_alt_iters=self.n_alt_iters,
-            feature_names=feature_names,
-            alpha_base=float(alpha_base),
-        )
+        _, yhat_fit = self._filter_state_and_forecast(returns2_np, alpha_fit, init_var)
+        self.init_var_ = float(init_var)
+        self.last_var_ = float(yhat_fit[-1]) if len(yhat_fit) else float(init_var)
         return self
 
-    def _fit_alternating_supervised(
+    def _fit_alternating(
         self,
         *,
         X_np: np.ndarray,
@@ -288,69 +504,255 @@ class XGBoostSTESModel(BaseVolatilityModel):
         init_var: float,
         params: Dict[str, Any],
         alpha_base: float,
-        feature_names: list[str],
+        feature_names: Tuple[str, ...],
     ) -> Any:
-        """A1: alternating supervised training with booster warm-start."""
+        """Alternating supervised loop on α*_t under the model loss."""
         n = int(len(y_np))
-        if n != int(len(returns2_np)):
-            raise ValueError("Length mismatch: y and returns must be aligned to rows.")
-
         alpha_pred = np.full(n, float(alpha_base), dtype=float)
         booster = None
-        eps = float(self.alt_clip_eps)
+
+        # params["objective"] is passed from fit()
 
         for _ in range(max(1, int(self.n_alt_iters))):
-            # 1) Compute v_t state and one-step forecasts yhat_t = v_{t+1|t}
-            v_state, _ = self._filter_state_and_forecast(returns2_np, alpha_pred, init_var)
-
-            # 2) Compute pseudo targets alpha*_t holding v_t fixed
-            alpha_star = self._compute_alpha_star(
+            v_state, _ = self._filter_state_and_forecast(
+                returns2_np, alpha_pred, init_var
+            )
+            alpha_star = self._alpha_star_for_loss(
                 y=y_np,
                 returns2=returns2_np,
                 v_state=v_state,
                 alpha_fallback=float(alpha_base),
             )
-            alpha_star = np.clip(alpha_star, eps, 1.0 - eps)
-            target = logit(alpha_star)
 
-            # --- Denominator masking for noisy alpha* labels ---
-            den = returns2_np - v_state
-            abs_den = np.abs(den)
-            finite_mask = np.isfinite(target) & np.isfinite(den)
-            finite_abs_den = abs_den[finite_mask]
-            if finite_abs_den.size > 0:
-                floor = max(self.min_denom_floor, np.quantile(finite_abs_den, self.denom_quantile))
-            else:
-                floor = self.min_denom_floor
-            mask = np.isfinite(target) & np.isfinite(den) & (abs_den >= floor)
-            if mask.sum() < max(10, int(0.05 * n)):
-                mask = np.ones(n, dtype=bool)
+            valid_n = int(max(1, np.floor(self.gate_valid_frac * n)))
+            valid_n = min(valid_n, max(1, n - 1))
+            split = max(1, n - valid_n)
+            tr = np.arange(split)
+            va = np.arange(split, n)
 
-            # 3) Fit (warm-start on the previous booster), with base_margin if enabled
             dtrain = xgb.DMatrix(
-                X_np[mask],
-                label=target[mask].astype(float),
-                feature_names=feature_names,
+                X_np[tr],
+                label=alpha_star[tr],
+                feature_names=list(feature_names),
             )
-            if self.residual_mode and self.base_margin_ is not None:
-                dtrain.set_base_margin(np.full(mask.sum(), self.base_margin_, dtype=float))
+            dvalid = xgb.DMatrix(
+                X_np[va],
+                label=alpha_star[va],
+                feature_names=list(feature_names),
+            )
 
             booster = xgb.train(
                 params=params,
                 dtrain=dtrain,
                 num_boost_round=self.num_boost_round,
-                evals=[(dtrain, "train")],
+                evals=[(dtrain, "train"), (dvalid, "valid")],
                 verbose_eval=False,
                 xgb_model=booster,
+                early_stopping_rounds=params.get("early_stopping_rounds", 10),
             )
 
-            # 4) Update alpha_pred from the current booster
-            d_all = xgb.DMatrix(X_np, feature_names=feature_names)
-            if self.residual_mode and self.base_margin_ is not None:
-                d_all.set_base_margin(np.full(n, self.base_margin_, dtype=float))
-            score = booster.predict(d_all)
-            alpha_pred = expit(score.astype(float))
+            d_all = xgb.DMatrix(X_np, feature_names=list(feature_names))
+            # Safety clip: works for reg:logistic (redundant but safe) and reg:pseudohuber (necessary)
+            alpha_pred = np.clip(booster.predict(d_all).astype(float), 0.0, 1.0)
 
+        return booster
+
+    # -------------------------- end-to-end (B2) ---------------------------
+    def _make_e2e_objective(
+        self,
+        *,
+        returns2: np.ndarray,
+        y: np.ndarray,
+        init_var: float,
+    ):
+        """Create (obj, feval) closures for xgboost.train."""
+        returns2 = np.asarray(returns2, dtype=float)
+        y = np.asarray(y, dtype=float)
+        n = int(len(y))
+        v0 = float(init_var)
+
+        loss = self.loss
+        huber_delta = self.huber_delta
+        scale = float(self.e2e_grad_hess_scale)
+        debug = bool(self.e2e_debug)
+        print_once = bool(self.e2e_debug_print_once)
+        printed = {"done": False}
+
+        def obj(preds: np.ndarray, dtrain: Any):
+            z = preds.astype(float)
+            alpha = expit(z)
+            v = np.empty(n + 1, dtype=float)
+            v[0] = v0
+            for t in range(n):
+                v[t + 1] = v[t] + alpha[t] * (returns2[t] - v[t])
+            yhat = v[1:]
+
+            e_next, w_next = self._loss_derivs(
+                yhat, y, loss=loss, huber_delta=huber_delta
+            )
+
+            g = np.zeros(n + 1, dtype=float)
+            S = np.zeros(n + 1, dtype=float)
+            grad = np.zeros(n, dtype=float)
+            hess = np.zeros(n, dtype=float)
+
+            for t in range(n - 1, -1, -1):
+                g[t + 1] += e_next[t]
+                S[t + 1] += w_next[t]
+
+                a = float(alpha[t])
+                ap = a * (1.0 - a)
+                denom = float(returns2[t] - v[t])
+                dv_dz = denom * ap
+
+                grad[t] = g[t + 1] * dv_dz
+                h = S[t + 1] * (dv_dz * dv_dz)
+                hess[t] = h if np.isfinite(h) and h > 1e-12 else 1e-12
+
+                g[t] += (1.0 - a) * g[t + 1]
+                S[t] += (1.0 - a) ** 2 * S[t + 1]
+
+            # Scaling knob: does not change Newton ratio grad/hess, but *does*
+            # change interaction with XGBoost regularization/min_child_weight.
+            if scale != 1.0:
+                grad *= scale
+                hess *= scale
+
+            # Debug prints (point 5): one-time summary of magnitudes.
+            if debug and (not printed["done"]):
+
+                def _summ(x: np.ndarray) -> Tuple[float, float, float, float]:
+                    return (
+                        float(np.min(x)),
+                        float(np.max(x)),
+                        float(np.mean(x)),
+                        float(np.std(x)),
+                    )
+
+                zmin, zmax, zmean, zstd = _summ(z)
+                amin, amax, amean, astd = _summ(alpha)
+                gmin, gmax = float(np.min(grad)), float(np.max(grad))
+                gmean, gabs = float(np.mean(grad)), float(np.mean(np.abs(grad)))
+                hmin, hmax, hmean = (
+                    float(np.min(hess)),
+                    float(np.max(hess)),
+                    float(np.mean(hess)),
+                )
+                logger.info(
+                    "[E2E] z(min,max,mean,std)=(%.4g, %.4g, %.4g, %.4g) | "
+                    "alpha(min,max,mean,std)=(%.4g, %.4g, %.4g, %.4g) | "
+                    "grad(min,max,mean,mean_abs)=(%.4g, %.4g, %.4g, %.4g) | "
+                    "hess(min,max,mean)=(%.4g, %.4g, %.4g) | scale=%.4g",
+                    zmin,
+                    zmax,
+                    zmean,
+                    zstd,
+                    amin,
+                    amax,
+                    amean,
+                    astd,
+                    gmin,
+                    gmax,
+                    gmean,
+                    gabs,
+                    hmin,
+                    hmax,
+                    hmean,
+                    scale,
+                )
+                if print_once:
+                    printed["done"] = True
+
+            return grad, hess
+
+        def feval(preds: np.ndarray, dtrain: Any):
+            z = preds.astype(float)
+            alpha = expit(z)
+            v = float(v0)
+            yhat = np.empty(n, dtype=float)
+            for t in range(n):
+                v = v + float(alpha[t]) * (float(returns2[t]) - v)
+                yhat[t] = v
+            return f"{loss}_e2e", self._loss_value(
+                yhat, y, loss=loss, huber_delta=huber_delta
+            )
+
+        return obj, feval
+
+    def _fit_end_to_end(
+        self,
+        *,
+        X_np: np.ndarray,
+        y_np: np.ndarray,
+        returns2_np: np.ndarray,
+        init_var: float,
+        params: Dict[str, Any],
+        feature_names: Tuple[str, ...],
+    ) -> Any:
+        # 1. Split Train/Valid for Early Stopping
+        n = len(y_np)
+        valid_n = int(max(1, np.floor(self.gate_valid_frac * n)))
+        # Ensure at least 1 row for valid, but not more than n-1
+        valid_n = min(valid_n, max(1, n - 1))
+        split = max(1, n - valid_n)
+
+        X_tr, X_va = X_np[:split], X_np[split:]
+        y_tr, y_va = y_np[:split], y_np[split:]
+        r2_tr, r2_va = returns2_np[:split], returns2_np[split:]
+
+        # 2. Warm Start for Validation Set
+        # We cannot start validation recursion from global init_var (e.g. 2000 data).
+        # We use the recent history of training data to approximate v_t at split point.
+        lookback = 20
+        if len(r2_tr) >= lookback:
+            v0_val = float(np.mean(r2_tr[-lookback:]))
+        else:
+            v0_val = float(init_var)
+
+        # 3. Create Objectives
+        # Training objective: drives gradient descent
+        obj_train, _ = self._make_e2e_objective(
+            returns2=r2_tr, y=y_tr, init_var=init_var
+        )
+        # Validation metric: drives early stopping (only needs feval)
+        _, feval_valid = self._make_e2e_objective(
+            returns2=r2_va, y=y_va, init_var=v0_val
+        )
+
+        dtrain = xgb.DMatrix(X_tr, label=y_tr, feature_names=list(feature_names))
+        dvalid = xgb.DMatrix(X_va, label=y_va, feature_names=list(feature_names))
+
+        booster = xgb.train(
+            params=params,
+            dtrain=dtrain,
+            num_boost_round=self.num_boost_round,
+            obj=obj_train,
+            custom_metric=feval_valid,
+            evals=[(dtrain, "train"), (dvalid, "valid")],
+            early_stopping_rounds=params.get("early_stopping_rounds", 10),
+            verbose_eval=False,
+        )
+
+        # Post-fit E2E sanity: if score/alpha are constant, the booster learned no splits.
+        if self.e2e_debug:
+            d_all = xgb.DMatrix(X_np, feature_names=list(feature_names))
+            score = booster.predict(d_all)
+            alpha = expit(score.astype(float))
+            s_std = float(np.std(score))
+            a_std = float(np.std(alpha))
+            logger.info(
+                "[E2E post-fit] score(std)=%.3g, alpha(std)=%.3g, score(mean)=%.6g, alpha(mean)=%.6g",
+                s_std,
+                a_std,
+                float(np.mean(score)),
+                float(np.mean(alpha)),
+            )
+            if a_std < 1e-10:
+                logger.warning(
+                    "[E2E post-fit] alpha is essentially constant. "
+                    "Try increasing e2e_grad_hess_scale (e.g., 1e6..1e9) and/or loosening "
+                    "regularization/min_child_weight."
+                )
         return booster
 
     def predict(
@@ -360,11 +762,12 @@ class XGBoostSTESModel(BaseVolatilityModel):
         returns: pd.Series,
         start_index: int = 0,
         end_index: Optional[int] = None,
-        **kwargs: Any,
+        init_var: Optional[float] = None,
+        warm_start_from_last_fit: bool = True,
+        **_: Any,
     ) -> pd.Series:
-        """Predict one-step-ahead variance aligned to X (forecast made at time t)."""
         self._check_xgb()
-        if self.model_ is None:
+        if self.model_ is None or self.output_mode_ is None:
             raise ValueError("Model has not been fitted.")
 
         if end_index is None:
@@ -372,7 +775,6 @@ class XGBoostSTESModel(BaseVolatilityModel):
 
         Xp = X.iloc[start_index:end_index].copy()
         rp = returns.iloc[start_index:end_index].copy()
-
         idx = Xp.index.intersection(rp.index)
         Xp = Xp.loc[idx]
         rp = rp.loc[idx]
@@ -382,30 +784,238 @@ class XGBoostSTESModel(BaseVolatilityModel):
 
         feature_names = list(Xp.columns)
         dtest = xgb.DMatrix(X_np, feature_names=feature_names)
-        if self.residual_mode and self.base_margin_ is not None:
-            dtest.set_base_margin(np.full(len(Xp), self.base_margin_, dtype=float))
         score = self.model_.predict(dtest)
-        alpha = expit(score.astype(float))
+        alpha = (
+            expit(score.astype(float))
+            if self.output_mode_ == "logit"
+            else np.clip(score.astype(float), 0.0, 1.0)
+        )
 
-        init_var = self._initial_variance(r2, self.init_window)
-        _, yhat = self._filter_state_and_forecast(r2, alpha, init_var)
+        if init_var is None and warm_start_from_last_fit and self.last_var_ is not None:
+            v0 = float(self.last_var_)
+        else:
+            v0 = (
+                float(init_var)
+                if init_var is not None
+                else self._initial_variance(r2, self.init_window)
+            )
 
+        _, yhat = self._filter_state_and_forecast(r2, alpha, v0)
         return pd.Series(yhat, index=Xp.index, name="yhat")
 
     def get_alphas(
         self, X: pd.DataFrame, *, start_index: int = 0, end_index: Optional[int] = None
     ) -> pd.Series:
-        """Return α_t series (row-aligned; used to update from r_t^2 to v_{t+1})."""
         self._check_xgb()
-        if self.model_ is None:
+        if self.model_ is None or self.output_mode_ is None:
             raise ValueError("Model has not been fitted.")
         if end_index is None:
             end_index = len(X)
+
         Xp = X.iloc[start_index:end_index]
-        feature_names = list(Xp.columns)
-        d = xgb.DMatrix(self._as_numpy(Xp), feature_names=feature_names)
-        if self.residual_mode and self.base_margin_ is not None:
-            d.set_base_margin(np.full(len(Xp), self.base_margin_, dtype=float))
+        d = xgb.DMatrix(self._as_numpy(Xp), feature_names=list(Xp.columns))
         score = self.model_.predict(d)
-        alpha = expit(score.astype(float))
+        alpha = (
+            expit(score.astype(float))
+            if self.output_mode_ == "logit"
+            else np.clip(score.astype(float), 0.0, 1.0)
+        )
         return pd.Series(alpha, index=Xp.index, name="alpha")
+
+    def run_cv_alternating(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        *,
+        returns: pd.Series,
+        param_grid: Iterable[Dict[str, Any]],
+        n_splits: int = 5,
+        start_index: int = 0,
+        end_index: Optional[int] = None,
+    ) -> List[Tuple[float, Dict[str, Any]]]:
+        """Run Time-Series CV specifically for the Alternating Method.
+
+        CRITICAL DIFFERENCE:
+        - TRAINS on alpha_star (proxy target) to mimic fit_alternating behavior.
+        - VALIDATES on realized variance (y) to measure true forecast quality.
+        This solves the 'Proxy Trap' by optimizing hyperparameters for the
+        end goal (forecasting), not the intermediate goal (mimicking the oracle).
+        """
+        self._check_xgb()
+
+        if end_index is None:
+            end_index = len(y)
+
+        # 1. Align Data
+        X_fit = X.iloc[start_index:end_index].copy()
+        y_fit = y.iloc[start_index:end_index].copy()
+        r_fit = returns.iloc[start_index:end_index].copy()
+        idx = X_fit.index.intersection(y_fit.index).intersection(r_fit.index)
+        X_fit, y_fit, r_fit = X_fit.loc[idx], y_fit.loc[idx], r_fit.loc[idx]
+
+        X_np = self._as_numpy(X_fit)
+        y_np = np.asarray(y_fit.values, dtype=float)
+        returns2_np = np.asarray(r_fit.values, dtype=float) ** 2
+        init_var_global = self._initial_variance(returns2_np, self.init_window)
+
+        # Pre-calculate alpha_star for the whole dataset to save time
+        # (We use a dummy pass to get the 'perfect' gates)
+        # Note: In a strict causal sense, we should recalc alpha_star per fold
+        # based on that fold's v_state, but using global alpha_star is a
+        # standard approximation for speed in the alternating method.
+        v_state_global, _ = self._filter_state_and_forecast(
+            returns2_np,
+            np.full(len(y_np), 0.05),  # Dummy alpha to get v_state
+            init_var_global,
+        )
+        alpha_star_global = self._alpha_star_for_loss(
+            y=y_np, returns2=returns2_np, v_state=v_state_global, alpha_fallback=0.05
+        )
+
+        tscv = TimeSeriesSplit(n_splits=n_splits)
+        results = []
+
+        for params_cand in param_grid:
+            p = dict(self.xgb_params)
+            p.update(params_cand)
+            # Match the logic in fit():
+            p["objective"] = (
+                "reg:logistic" if self.loss == "mse" else "reg:pseudohubererror"
+            )
+
+            fold_scores = []
+
+            for fold_idx, (train_idx, valid_idx) in enumerate(tscv.split(X_np)):
+                # A. Slice Data
+                X_tr, X_va = X_np[train_idx], X_np[valid_idx]
+                # Train Labels: ALPHA STAR (The Proxy)
+                astar_tr = alpha_star_global[train_idx]
+                # Valid Labels: REALIZED VAR (The Truth)
+                y_va = y_np[valid_idx]
+                r2_va = returns2_np[valid_idx]
+
+                # B. Train on Proxy
+                dtrain = xgb.DMatrix(X_tr, label=astar_tr)
+                booster = xgb.train(
+                    params=p, dtrain=dtrain, num_boost_round=self.num_boost_round
+                )
+
+                # C. Predict Alpha
+                dvalid = xgb.DMatrix(X_va)
+                # Clip is required if p["objective"] is reg:pseudohuber
+                alpha_pred = np.clip(booster.predict(dvalid).astype(float), 0.0, 1.0)
+
+                # D. Validate on "Truth" (Warm Start Recursion)
+                # Heuristic v0 for validation segment
+                v0_va = float(np.mean(returns2_np[train_idx][-20:]))
+
+                # Run filter with predicted alphas
+                _, yhat = self._filter_state_and_forecast(r2_va, alpha_pred, v0_va)
+
+                # E. Score (MSE of Variance Forecast)
+                fold_loss = np.mean((yhat - y_va) ** 2)
+                fold_scores.append(fold_loss)
+
+            avg_score = np.mean(fold_scores)
+            logger.info("Alt CV Params: %s | MSE: %.6f", params_cand, avg_score)
+            results.append((avg_score, params_cand))
+
+        results.sort(key=lambda x: x[0])
+        return results
+
+    def run_cv_e2e(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        *,
+        returns: pd.Series,
+        param_grid: Iterable[Dict[str, Any]],
+        n_splits: int = 5,
+        start_index: int = 0,
+        end_index: Optional[int] = None,
+    ) -> List[Tuple[float, Dict[str, Any]]]:
+        """Run Time-Series CV (End-to-End) to find optimal hyperparameters.
+
+        Uses an expanding window strategy with 'warm start' initialization for
+        validation folds to robustly test recursive volatility performance.
+        """
+        self._check_xgb()
+
+        if end_index is None:
+            end_index = len(y)
+
+        # 1. Align Data
+        X_fit = X.iloc[start_index:end_index].copy()
+        y_fit = y.iloc[start_index:end_index].copy()
+        r_fit = returns.iloc[start_index:end_index].copy()
+        idx = X_fit.index.intersection(y_fit.index).intersection(r_fit.index)
+        X_fit = X_fit.loc[idx]
+        y_fit = y_fit.loc[idx]
+        r_fit = r_fit.loc[idx]
+
+        X_np = self._as_numpy(X_fit)
+        y_np = np.asarray(y_fit.values, dtype=float)
+        returns2_np = np.asarray(r_fit.values, dtype=float) ** 2
+        init_var_global = self._initial_variance(returns2_np, self.init_window)
+
+        tscv = TimeSeriesSplit(n_splits=n_splits)
+        results = []
+
+        logger.info(f"Starting E2E CV with {n_splits} splits on {len(X_np)} rows.")
+
+        for params_cand in param_grid:
+            # Merge candidate params with defaults/existing
+            p = dict(self.xgb_params)
+            p.update(params_cand)
+
+            fold_scores = []
+
+            for fold_idx, (train_idx, valid_idx) in enumerate(tscv.split(X_np)):
+                # A. Slice Data
+                X_tr, X_va = X_np[train_idx], X_np[valid_idx]
+                y_tr, y_va = y_np[train_idx], y_np[valid_idx]
+                r2_tr, r2_va = returns2_np[train_idx], returns2_np[valid_idx]
+
+                # B. Warm Start Initialization
+                v0_tr = init_var_global
+                # Heuristic: use mean realized var of last 20 days of train as proxy for v_t
+                lookback = 20
+                if len(r2_tr) >= lookback:
+                    v0_va = float(np.mean(r2_tr[-lookback:]))
+                else:
+                    v0_va = init_var_global
+
+                # C. Closures for this fold
+                # _make_e2e_objective returns (obj, feval), we bind them to slice data
+                obj_closure = self._make_e2e_objective(
+                    returns2=r2_tr, y=y_tr, init_var=v0_tr
+                )[0]
+                feval_closure = self._make_e2e_objective(
+                    returns2=r2_va, y=y_va, init_var=v0_va
+                )[1]
+
+                dtrain = xgb.DMatrix(X_tr, label=y_tr)
+                dvalid = xgb.DMatrix(X_va, label=y_va)
+
+                # D. Train
+                booster = xgb.train(
+                    params=p,
+                    dtrain=dtrain,
+                    num_boost_round=self.num_boost_round,
+                    obj=obj_closure,
+                    custom_metric=feval_closure,
+                    evals=[(dvalid, "valid")],
+                    early_stopping_rounds=p.get("early_stopping_rounds", 10),
+                    verbose_eval=False,
+                )
+
+                # Best score is the metric (e.g., mse_e2e) on validation
+                fold_scores.append(booster.best_score)
+
+            avg_score = np.mean(fold_scores)
+            logger.info("CV Params: %s | Score: %.6f", params_cand, avg_score)
+            results.append((avg_score, params_cand))
+
+        # Return best params first
+        results.sort(key=lambda x: x[0])
+        return results

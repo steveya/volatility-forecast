@@ -1,7 +1,6 @@
 import os
 from sqlalchemy import create_engine, Column, Integer, Float, Date, String
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import declarative_base, sessionmaker
 from dotenv import load_dotenv
 
 
@@ -50,7 +49,24 @@ def get_loca_database_url():
 engine = create_engine(get_loca_database_url())
 Base.metadata.create_all(engine)
 Session = sessionmaker(bind=engine)
+_SESSION_OVERRIDE = None
+
+
+def set_session_override(session):
+    global _SESSION_OVERRIDE
+    _SESSION_OVERRIDE = session
+
+
+def clear_session_override():
+    global _SESSION_OVERRIDE
+    _SESSION_OVERRIDE = None
 
 
 def get_session():
+    if _SESSION_OVERRIDE is not None:
+        return _SESSION_OVERRIDE
     return Session()
+
+
+def is_session_override(session) -> bool:
+    return _SESSION_OVERRIDE is not None and session is _SESSION_OVERRIDE

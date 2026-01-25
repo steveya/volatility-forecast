@@ -10,11 +10,9 @@ from alphaforge.features.frame import FeatureFrame
 from alphaforge.features.ids import make_feature_id, group_path
 
 
-class _BaseLagTemplate:
+class _PriceTemplate:
     # no version here
     base_param_space = {
-        "lags": ParamSpec("int", default=5, low=1, high=252),
-        # allow simulated source for tests/examples
         "source": ParamSpec(
             "categorical", default="tiingo", choices=["tiingo", "simulated_garch"]
         ),
@@ -52,14 +50,22 @@ class _BaseLagTemplate:
         )
         return panel, table, price_col
 
+    def _logprice(self, panel, price_col: str) -> pd.Series:
+        px = panel.df[price_col].astype(float)
+        return np.log(px).groupby(level="entity_id")
+
     def _logret(self, panel, price_col: str) -> pd.Series:
         px = panel.df[price_col].astype(float)
         return np.log(px).groupby(level="entity_id").diff()
 
 
-class LagLogReturnTemplate(_BaseLagTemplate):
+class LagLogReturnTemplate(_PriceTemplate):
     version = "1.0"
     name = "lag_logret"
+
+    param_space = _PriceTemplate.param_space | {
+        "lags": ParamSpec("int", default=5, low=1, high=252),
+    }
 
     def transform(
         self, ctx: DataContext, params: Dict[str, Any], slice: SliceSpec, state
@@ -93,9 +99,13 @@ class LagLogReturnTemplate(_BaseLagTemplate):
         )
 
 
-class LagAbsLogReturnTemplate(_BaseLagTemplate):
+class LagAbsLogReturnTemplate(_PriceTemplate):
     name = "lag_abslogret"
     version = "1.0"
+
+    param_space = _PriceTemplate.param_space | {
+        "lags": ParamSpec("int", default=5, low=1, high=252),
+    }
 
     def transform(
         self, ctx: DataContext, params: Dict[str, Any], slice: SliceSpec, state
@@ -147,9 +157,13 @@ class LagAbsLogReturnTemplate(_BaseLagTemplate):
         )
 
 
-class LagSquaredLogReturnTemplate(_BaseLagTemplate):
+class LagSquaredLogReturnTemplate(_PriceTemplate):
     name = "lag_sqlogret"
     version = "1.0"
+
+    param_space = _PriceTemplate.param_space | {
+        "lags": ParamSpec("int", default=5, low=1, high=252),
+    }
 
     def transform(
         self, ctx: DataContext, params: Dict[str, Any], slice: SliceSpec, state
@@ -205,13 +219,9 @@ class OffsetLogReturnTemplate:
     version = "1.0"
     name = "offset_logret"
 
-    param_space = {
+    param_space = _PriceTemplate.param_space | {
+        "lags": ParamSpec("int", default=5, low=1, high=252),
         "k": ParamSpec("int", default=1, low=1, high=252),
-        "source": ParamSpec("categorical", default="tiingo", choices=["tiingo"]),
-        "table": ParamSpec(
-            "categorical", default="market.ohlcv", choices=["market.ohlcv"]
-        ),
-        "price_col": ParamSpec("categorical", default="close", choices=["close"]),
     }
 
     def requires(self, params: Dict[str, Any]) -> List[Tuple[str, Query]]:
@@ -259,71 +269,6 @@ class OffsetLogReturnTemplate:
                         "source_table": table,
                         "source_col": price_col,
                         "k": k,
-                    }
-                ]
-            )
-            .set_index("feature_id")
-            .sort_index()
-        )
-
-        return FeatureFrame(
-            X=X, catalog=catalog, meta={"template": self.name, "version": self.version}
-        )
-
-
-class SquaredLogReturnTemplate:
-    version = "1.0"
-    name = "sq_logret"
-
-    param_space = {
-        "source": ParamSpec("categorical", default="tiingo", choices=["tiingo"]),
-        "table": ParamSpec(
-            "categorical", default="market.ohlcv", choices=["market.ohlcv"]
-        ),
-        "price_col": ParamSpec("categorical", default="close", choices=["close"]),
-    }
-
-    def requires(self, params: Dict[str, Any]) -> List[Tuple[str, Query]]:
-        return []
-
-    def transform(
-        self, ctx: DataContext, params: Dict[str, Any], slice: SliceSpec, state
-    ):
-        source, table, price_col = (
-            params["source"],
-            params["table"],
-            params["price_col"],
-        )
-
-        panel = ctx.fetch_panel(
-            source,
-            Query(
-                table=table,
-                columns=[price_col],
-                start=slice.start,
-                end=slice.end,
-                entities=slice.entities,
-                asof=slice.asof,
-                grid=slice.grid,
-            ),
-        )
-
-        px = panel.df[price_col].astype(float)
-        logret = np.log(px).groupby(level="entity_id").diff()
-        logret2 = logret**2
-
-        fid = make_feature_id(table, "*", "ret", "sqlogret", {})
-        X = pd.DataFrame({fid: logret2}, index=panel.df.index).sort_index()
-        catalog = (
-            pd.DataFrame(
-                [
-                    {
-                        "feature_id": fid,
-                        "group_path": group_path("ret", "sqlogret", {}),
-                        "family": "ret",
-                        "transform": "sqlogret",
-                        "source_table": table,
-                        "source_col": price_col,
                     }
                 ]
             )

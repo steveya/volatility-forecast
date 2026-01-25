@@ -22,6 +22,8 @@ from alphaforge.features.dataset_spec import (
 from alphaforge.features.dataset_builder import build_dataset
 
 from .sources.tiingo_eod import TiingoEODSource
+from alphaforge.data.cache import CacheBackend
+from alphaforge.store.raw_data_store import RawDataStore
 
 
 @dataclass(frozen=True)
@@ -52,7 +54,9 @@ class VolDatasetSpec:
 
 def build_default_ctx(
     tiingo_api_key: Optional[str] = None,
-    store_root: str = ".alphaforge_store",
+    tiingo_cache_backends: Optional[Sequence[CacheBackend]] = None,
+    tiingo_cache_mode: Optional[str] = None,
+    tiingo_raw_store: Optional[RawDataStore] = None,
 ) -> DataContext:
     """Construct a default Alphaforge DataContext for the vol domain.
 
@@ -64,7 +68,12 @@ def build_default_ctx(
     from alphaforge.store.duckdb_parquet import DuckDBParquetStore
 
     cal = TradingCalendar("XNYS", tz="UTC")
-    src = TiingoEODSource(api_key=tiingo_api_key)
+    src = TiingoEODSource(
+        api_key=tiingo_api_key,
+        cache_backends=tiingo_cache_backends or (),
+        cache_mode=tiingo_cache_mode or "use",
+        raw_store=tiingo_raw_store,
+    )
     store = DuckDBParquetStore(root=".af_store")
 
     return DataContext(
@@ -144,7 +153,6 @@ def build_vol_dataset(
         ret = ret.loc[idx]
 
     return X, y, ret, catalog
-
 
 
 def build_wide_dataset(ctx: DataContext, spec: VolDatasetSpec, *, entity_id: str):

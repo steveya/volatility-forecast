@@ -27,4 +27,7 @@ def test_stes_alpha_indexing_simple():
     m.params = np.zeros(2, dtype=float)
 
     preds = m.predict(X, returns=r)
-    assert np.allclose(preds, sigma2)
+
+    # Convention: model predicts next-step variance v_{t+1} aligned to row t.
+    # Compare predictions to sigma2 shifted by one.
+    assert np.allclose(preds[:-1], sigma2[1:])

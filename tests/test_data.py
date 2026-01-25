@@ -1,5 +1,6 @@
 import pandas as pd
 import pandas_market_calendars as mcal
+import numpy as np
 
 from datetime import datetime, timedelta
 from sqlalchemy.orm import sessionmaker
@@ -19,7 +20,7 @@ from volatility_forecast.data.date_util import (
 )
 from volatility_forecast.data.dataset import PriceVolume
 from volatility_forecast.data.persistence import persist_data, load_data_from_db
-from volatility_forecast.data.database import engine, Base
+from volatility_forecast.data.database import Base, set_session_override, clear_session_override
 
 
 class TestTingleEoDDataLoader(unittest.TestCase):
@@ -84,8 +85,13 @@ class TestDataSet(unittest.TestCase):
 class TestLoaderAndPersistence(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        # Create tables
-        Base.metadata.create_all(engine)
+        # Use an in-memory database so tests are deterministic and do not rely on
+        # external Tiingo credentials or network access.
+        cls.engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(cls.engine)
+        cls.Session = sessionmaker(bind=cls.engine)
+        cls.session = cls.Session()
+        set_session_override(cls.session)
 
         cls.tickers = (
             "SPY",
@@ -100,6 +106,35 @@ class TestLoaderAndPersistence(unittest.TestCase):
             mcal.get_calendar("NYSE"),
         )
         cls.loader = TiingoEodDataLoaderProd(cls.tickers)
+
+        # Seed the DB with synthetic but deterministic data for the requested window
+        # (and one extra day, used by test_fetch_new_data).
+        seed_end = cls.end_date + timedelta(days=1)
+        dates = pd.date_range(cls.start_date, seed_end)
+        for k, ticker in enumerate(cls.tickers):
+            base = 100.0 + 10.0 * k
+            close = base + np.arange(len(dates), dtype=float)
+            df = pd.DataFrame(
+                {
+                    "open": close,
+                    "high": close + 1.0,
+                    "low": close - 1.0,
+                    "close": close,
+                    "volume": 1_000_000.0 + 1000.0 * k,
+                },
+                index=dates,
+            )
+            persist_data(df, ticker, session=cls.session)
+
+    @classmethod
+    def tearDownClass(cls):
+        try:
+            clear_session_override()
+        finally:
+            try:
+                cls.session.close()
+            except Exception:
+                pass
 
     def setUp(self):
         # This method will be called before each test

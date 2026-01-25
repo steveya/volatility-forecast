@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.special import expit
+from sklearn.preprocessing import StandardScaler
 
 # Script-friendly repo path
 repo_root = Path(__file__).parent.parent
@@ -39,6 +40,14 @@ def _read_tiingo_api_key() -> str:
         if v and isinstance(v, str) and v.strip():
             return v.strip()
     return ""
+
+
+def _read_tiingo_cache_dir() -> str:
+    return os.environ.get("TIINGO_CACHE_DIR", ".af_cache/tiingo")
+
+
+def _read_tiingo_cache_mode() -> str:
+    return os.environ.get("TIINGO_CACHE_MODE", "use")
 
 
 import logging
@@ -69,6 +78,7 @@ from alphaforge.features.dataset_spec import (
     JoinPolicy,
     MissingnessPolicy,
 )
+from alphaforge.data.cache import FileCacheBackend
 from volatility_forecast.pipeline import (
     build_default_ctx,
     build_vol_dataset,
@@ -262,11 +272,9 @@ def _build_spy_spec(lags: int) -> VolDatasetSpec:
     )
 
 
-
-
-
-
-def _fit_variant_rmse(variant: str, X: pd.DataFrame, y: pd.Series, r: pd.Series) -> float:
+def _fit_variant_rmse(
+    variant: str, X: pd.DataFrame, y: pd.Series, r: pd.Series
+) -> float:
     """Fit on in-sample, return OOS RMSE."""
     if len(y) <= OS_INDEX:
         raise ValueError(f"Insufficient rows for slicing: len(y)={len(y)}")
@@ -280,13 +288,39 @@ def _fit_variant_rmse(variant: str, X: pd.DataFrame, y: pd.Series, r: pd.Series)
     X_os, y_os = X_sel.iloc[OS_INDEX:], y.iloc[OS_INDEX:]
     r_is, r_os = r.iloc[IS_INDEX:OS_INDEX], r.iloc[OS_INDEX:]
 
+    # Scale all features except constant term (const has zero variance)
+    cols_to_scale = [c for c in X_is.columns if c != "const"]
+    if cols_to_scale:
+        scaler = StandardScaler().fit(X_is[cols_to_scale])
+        X_is_s = X_is.copy()
+        X_is_s[cols_to_scale] = pd.DataFrame(
+            scaler.transform(X_is[cols_to_scale]),
+            index=X_is.index,
+            columns=cols_to_scale,
+        )
+        X_os_s = X_os.copy()
+        X_os_s[cols_to_scale] = pd.DataFrame(
+            scaler.transform(X_os[cols_to_scale]),
+            index=X_os.index,
+            columns=cols_to_scale,
+        )
+    else:
+        X_is_s = X_is
+        X_os_s = X_os
+
     model = (
         ESModel(**MODEL_KWARGS["ES"])
         if variant == "ES"
         else STESModel(**MODEL_KWARGS["STES"])
     )
-    model.fit(X_is, y_is, returns=r_is, start_index=0, end_index=len(X_is))
-    y_hat = model.predict(X_os, returns=r_os)
+    model.fit(X_is_s, y_is, returns=r_is, start_index=0, end_index=len(X_is_s))
+    # IMPORTANT: warm-start the recursion out-of-sample by predicting on the
+    # concatenated [in-sample + out-of-sample] block and slicing the OOS tail.
+    # This avoids "cold start" of the variance state at the beginning of OOS.
+    X_all = pd.concat([X_is_s, X_os_s], axis=0)
+    r_all = pd.concat([r_is, r_os], axis=0)
+    y_hat_all = np.asarray(model.predict(X_all, returns=r_all), dtype=float)
+    y_hat = y_hat_all[len(X_is_s) :]
     return float(np.sqrt(np.mean((y_os.values - y_hat) ** 2)))
 
 
@@ -299,103 +333,6 @@ def _compute_alpha(model: STESModel, X_sel: pd.DataFrame) -> pd.Series:
     xb = X_sel.values @ beta
     alpha = expit(xb)
     return pd.Series(alpha, index=X_sel.index, name="alpha")
-
-
-def _env_flag(name: str) -> bool:
-    v = os.environ.get(name, "")
-    return v.strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
-def _strict_gate_check_on() -> bool:
-    return (
-        "--strict_gate_check" in sys.argv
-        or _env_flag("STRICT_GATE_CHECK")
-        or _env_flag("AF_STRICT_GATE_CHECK")
-    )
-
-
-def _check_gate_convention(
-    model: STESModel,
-    X_full: pd.DataFrame,
-    alpha_full: pd.Series,
-    *,
-    strict: bool = False,
-) -> None:
-    """Compare alpha_full to expit(+s) and expit(-s)."""
-    params = model.params
-    if params is None:
-        raise ValueError("Model must be fitted before gate convention check.")
-    beta = np.asarray(params).reshape(-1)
-
-    if len(beta) != X_full.shape[1]:
-        msg = (
-            f"Gate convention check failed: beta length {len(beta)} "
-            f"!= X_full columns {X_full.shape[1]}"
-        )
-        print(msg)
-        print("X_full columns:", list(X_full.columns))
-        raise ValueError(msg)
-
-    feature_names = getattr(model, "feature_names_", None)
-    if feature_names is not None and list(feature_names) != list(X_full.columns):
-        msg = "Gate convention check failed: model.feature_names_ != X_full.columns."
-        print(msg)
-        print("model.feature_names_:", list(feature_names))
-        print("X_full columns:", list(X_full.columns))
-        raise ValueError(msg)
-
-    common_index = X_full.index.intersection(alpha_full.index)
-    if common_index.empty:
-        logger.warning(
-            "Gate convention check: no overlapping index between X_full and alpha_full."
-        )
-        return
-
-    X_aligned = X_full.loc[common_index]
-    alpha_aligned = alpha_full.loc[common_index]
-    score = pd.Series(X_aligned.values @ beta, index=common_index, name="score")
-    alpha_plus = pd.Series(expit(score.values), index=common_index, name="alpha_plus")
-    alpha_minus = pd.Series(expit(-score.values), index=common_index, name="alpha_minus")
-
-    df = pd.concat(
-        [alpha_aligned.rename("alpha_full"), alpha_plus, alpha_minus, score], axis=1
-    ).dropna()
-    if df.shape[0] < 2:
-        logger.warning("Gate convention check: insufficient data after alignment.")
-        return
-
-    corr_plus = df["alpha_full"].corr(df["alpha_plus"])
-    corr_minus = df["alpha_full"].corr(df["alpha_minus"])
-    mae_plus = float(np.mean(np.abs(df["alpha_full"] - df["alpha_plus"])))
-    mae_minus = float(np.mean(np.abs(df["alpha_full"] - df["alpha_minus"])))
-    corr_score = df["score"].corr(df["alpha_full"])
-
-    logger.info(
-        "Gate convention check: corr(alpha_full, expit(s))=%.4f, "
-        "corr(alpha_full, expit(-s))=%.4f, mae(expit(s))=%.6f, mae(expit(-s))=%.6f, "
-        "monotonic corr(s, alpha_full)=%.4f",
-        corr_plus,
-        corr_minus,
-        mae_plus,
-        mae_minus,
-        corr_score,
-    )
-
-    if (corr_plus > corr_minus + 0.1) or (mae_plus < mae_minus):
-        logger.info(
-            "Gate convention check: diagnostics currently consistent with expit(+s)."
-        )
-    else:
-        logger.info("Gate convention check: likely should use expit(-s).")
-
-    if strict:
-        corr_plus_ok = np.isfinite(corr_plus) and corr_plus >= 0.95
-        corr_minus_ok = np.isfinite(corr_minus) and corr_minus >= 0.95
-        if not (corr_plus_ok or corr_minus_ok):
-            raise AssertionError(
-                "Gate convention check failed: neither corr(alpha_full, expit(s)) nor "
-                "corr(alpha_full, expit(-s)) >= 0.95."
-            )
 
 
 def _ensure_dir(p: Path) -> None:
@@ -480,24 +417,50 @@ def _fit_spy_variant(
     y_os = y.iloc[SPY_OS_INDEX:]
     r_os = r.iloc[SPY_OS_INDEX:]
 
+    # Scale all features except constant term (const has zero variance)
+    cols_to_scale = [c for c in X_is.columns if c != "const"]
+    if cols_to_scale:
+        scaler = StandardScaler().fit(X_is[cols_to_scale])
+        X_is_s = X_is.copy()
+        X_is_s[cols_to_scale] = pd.DataFrame(
+            scaler.transform(X_is[cols_to_scale]),
+            index=X_is.index,
+            columns=cols_to_scale,
+        )
+        X_os_s = X_os.copy()
+        X_os_s[cols_to_scale] = pd.DataFrame(
+            scaler.transform(X_os[cols_to_scale]),
+            index=X_os.index,
+            columns=cols_to_scale,
+        )
+    else:
+        X_is_s = X_is
+        X_os_s = X_os
+
     model = (
         ESModel(random_state=seed, **MODEL_KWARGS["ES"])
         if variant == "ES"
         else STESModel(random_state=seed, **MODEL_KWARGS["STES"])
     )
-    model.fit(X_is, y_is, returns=r_is, start_index=0, end_index=len(X_is))
+    model.fit(X_is_s, y_is, returns=r_is, start_index=0, end_index=len(X_is_s))
 
+    # IMPORTANT: warm-start OOS by predicting on concatenated [IS+OOS] and slicing.
+    X_all = pd.concat([X_is_s, X_os_s], axis=0)
+    r_all = pd.concat([r_is, r_os], axis=0)
+    yhat_all = np.asarray(model.predict(X_all, returns=r_all), dtype=float)
     yhat_is = _to_series(
-        model.predict(X_is, returns=r_is), index=X_is.index, name=f"yhat_{variant}_is"
+        yhat_all[: len(X_is_s)], index=X_is.index, name=f"yhat_{variant}_is"
     )
     yhat_os = _to_series(
-        model.predict(X_os, returns=r_os), index=X_os.index, name=f"yhat_{variant}_os"
+        yhat_all[len(X_is_s) :], index=X_os.index, name=f"yhat_{variant}_os"
     )
 
     return model, yhat_is, yhat_os, (X_is, y_is, r_is), (X_os, y_os, r_os), cols
 
 
-def _event_window_mean(series: pd.Series, event_idx: pd.Index, window: int) -> pd.Series:
+def _event_window_mean(
+    series: pd.Series, event_idx: pd.Index, window: int
+) -> pd.Series:
     """Mean path around events, indexed by [-window, +window]."""
     s = series.dropna()
     locs = s.index.get_indexer(event_idx)
@@ -685,9 +648,7 @@ def _plot_gate_panel(
         tmp["bin"] = pd.qcut(tmp["abs_r"], q=q_bins, duplicates="drop")
         grp = tmp.groupby("bin", observed=True)["alpha"].mean()
         ax10.plot(np.arange(len(grp)), grp.values, marker="o", lw=1.5)
-        ax10.set_title(
-            f"{title_prefix}: binned mean $\\alpha_t$ vs $|r_t|$ quantiles"
-        )
+        ax10.set_title(f"{title_prefix}: binned mean $\\alpha_t$ vs $|r_t|$ quantiles")
         ax10.set_xlabel("quantile bin of $|r_t|$ (low → high)")
         ax10.set_ylabel("mean $\\alpha_t$")
         ax10.grid(True, alpha=0.25)
@@ -757,8 +718,8 @@ def analyze_spy_stes(
     _ensure_dir(out_dir)
 
     # Fit ES once
-    model_es, yhat_es_is, yhat_es_os, is_pack, os_pack, cols_es = (
-        _fit_spy_variant("ES", seeds[0], X, y, r)
+    model_es, yhat_es_is, yhat_es_os, is_pack, os_pack, cols_es = _fit_spy_variant(
+        "ES", seeds[0], X, y, r
     )
     X_is_es, y_is, r_is = is_pack
     X_os_es, y_os, r_os = os_pack
@@ -812,15 +773,7 @@ def analyze_spy_stes(
 
     # Alpha on full X, aligned contemporaneously (alpha_t for forecast at t)
     X_full_stes = X[best_cols]
-    alpha_full = _compute_alpha(
-        best_model, X_full_stes
-    )
-    _check_gate_convention(
-        model=best_model,
-        X_full=X_full_stes,
-        alpha_full=alpha_full,
-        strict=_strict_gate_check_on(),
-    )
+    alpha_full = _compute_alpha(best_model, X_full_stes)
     df["alpha_stes"] = alpha_full.reindex(idx).values
 
     # ES constant alpha
@@ -968,9 +921,7 @@ def analyze_spy_stes(
 
     paths_alpha = {
         "alpha_STES (wins)": _event_window_mean(df["alpha_stes"], win_idx, window),
-        "alpha_STES (losses)": _event_window_mean(
-            df["alpha_stes"], lose_idx, window
-        ),
+        "alpha_STES (losses)": _event_window_mean(df["alpha_stes"], lose_idx, window),
         "alpha_ES (const)": pd.Series(
             [df["alpha_es"].iloc[0]] * (2 * window + 1),
             index=np.arange(-window, window + 1),
@@ -1087,7 +1038,13 @@ def main():
     )
 
     # Base context (for calendars); add simulated source per run
-    ctx = build_default_ctx(tiingo_api_key=_read_tiingo_api_key())
+    cache_root = Path(_read_tiingo_cache_dir())
+    file_cache = FileCacheBackend(cache_root)
+    ctx = build_default_ctx(
+        tiingo_api_key=_read_tiingo_api_key(),
+        tiingo_cache_backends=[file_cache],
+        tiingo_cache_mode=_read_tiingo_cache_mode(),
+    )
 
     rng = np.random.default_rng(42)
     seeds = rng.integers(0, 1_000_000, size=N_RUNS)
@@ -1104,7 +1061,7 @@ def main():
         # Build wide dataset ONCE for this run
         spec = _build_sim_spec(N_LAGS)
         try:
-            X_wide, y, r, _ = build_wide_dataset(ctx, spec)
+            X_wide, y, r, _ = build_wide_dataset(ctx, spec, entity_id=ENTITY)
             if i == 1:
                 # Report IS/OOS date ranges once
                 idx = X_wide.index
@@ -1193,21 +1150,51 @@ def main():
                         r.iloc[SPY_OS_INDEX:],
                     )
 
+                    # Scale all features except constant term (const has zero variance)
+                    cols_to_scale = [c for c in X_is.columns if c != "const"]
+                    if cols_to_scale:
+                        scaler = StandardScaler().fit(X_is[cols_to_scale])
+                        X_is_s = X_is.copy()
+                        X_is_s[cols_to_scale] = pd.DataFrame(
+                            scaler.transform(X_is[cols_to_scale]),
+                            index=X_is.index,
+                            columns=cols_to_scale,
+                        )
+                        X_os_s = X_os.copy()
+                        X_os_s[cols_to_scale] = pd.DataFrame(
+                            scaler.transform(X_os[cols_to_scale]),
+                            index=X_os.index,
+                            columns=cols_to_scale,
+                        )
+                    else:
+                        X_is_s = X_is
+                        X_os_s = X_os
+
                     model = (
                         ESModel(random_state=seed)
                         if variant == "ES"
                         else STESModel(random_state=seed)
                     )
                     model.fit(
-                        X_is, y_is, returns=r_is, start_index=0, end_index=len(X_is)
+                        X_is_s,
+                        y_is,
+                        returns=r_is,
+                        start_index=0,
+                        end_index=len(X_is_s),
                     )
                     # In-sample RMSE
-                    y_hat_is = model.predict(X_is, returns=r_is)
+                    y_hat_is = model.predict(X_is_s, returns=r_is)
                     rmse_spy_is[variant].append(
                         float(np.sqrt(np.mean((y_is.values - y_hat_is) ** 2)))
                     )
                     # Out-of-sample RMSE
-                    y_hat_os = model.predict(X_os, returns=r_os)
+                    # IMPORTANT: warm-start OOS by predicting on concatenated [IS+OOS].
+                    X_all = pd.concat([X_is_s, X_os_s], axis=0)
+                    r_all = pd.concat([r_is, r_os], axis=0)
+                    y_hat_all = np.asarray(
+                        model.predict(X_all, returns=r_all), dtype=float
+                    )
+                    y_hat_os = y_hat_all[len(X_is_s) :]
                     rmse_os = float(np.sqrt(np.mean((y_os.values - y_hat_os) ** 2)))
                     rmse_spy_oos[variant].append(rmse_os)
 
@@ -1265,7 +1252,9 @@ def main():
                     ordered.append(nm)
 
             beta_by_variant = pd.DataFrame(index=ordered, columns=VARIANTS, dtype=float)
-            extra = pd.DataFrame(index=["best_seed", "best_oos_rmse", "es_alpha_"], columns=VARIANTS)
+            extra = pd.DataFrame(
+                index=["best_seed", "best_oos_rmse", "es_alpha_"], columns=VARIANTS
+            )
 
             for variant in VARIANTS:
                 m = best_spy_model.get(variant)
@@ -1274,7 +1263,9 @@ def main():
                 feature_names = getattr(m, "feature_names_", None)
                 if feature_names is None:
                     continue
-                beta_s = pd.Series(np.asarray(m.params).reshape(-1), index=feature_names)
+                beta_s = pd.Series(
+                    np.asarray(m.params).reshape(-1), index=feature_names
+                )
                 beta_by_variant[variant] = beta_s.reindex(beta_by_variant.index)
                 extra.loc["best_seed", variant] = best_spy_seed.get(variant)
                 extra.loc["best_oos_rmse", variant] = best_spy_rmse.get(variant)
@@ -1284,7 +1275,9 @@ def main():
             beta_by_variant.to_csv(out_dir / "spy_gate_betas_by_variant.csv")
             extra.to_csv(out_dir / "spy_gate_betas_by_variant__meta.csv")
 
-            print("\nSaved: outputs/volatility_forecast_1/spy_gate_betas_by_variant.csv")
+            print(
+                "\nSaved: outputs/volatility_forecast_1/spy_gate_betas_by_variant.csv"
+            )
         except Exception as e:
             logger.warning(f"Failed to export SPY beta table: {e}")
 

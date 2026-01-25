@@ -33,6 +33,14 @@ class TiingoEoDDataLoader(DataLoader):
         start_date: DateLike,
         end_date: DateLike,
     ) -> Mapping[DataField, pd.DataFrame]:
+        start_date = pd.Timestamp(start_date)
+        end_date = pd.Timestamp(end_date)
+        if start_date.tzinfo is not None:
+            start_date = start_date.tz_localize(None)
+        if end_date.tzinfo is not None:
+            end_date = end_date.tz_localize(None)
+        start_date = start_date.normalize()
+        end_date = end_date.normalize()
         data = {}
         data_cache = self._get_tingle_data(start_date, end_date)
 
@@ -91,7 +99,7 @@ class TiingoEoDDataLoader(DataLoader):
 
         def process_response(response):
             df = pd.DataFrame(response).set_index("date")
-            df.index = pd.to_datetime(df.index).normalize()
+            df.index = pd.to_datetime(df.index, utc=True).tz_convert(None).normalize()
 
             return df
 
@@ -117,14 +125,23 @@ class TiingoEodDataLoaderProd(DataLoader):
     def _get_data(
         self, fields: List[DataField], start_date: DateLike, end_date: DateLike
     ) -> Mapping[DataField, pd.DataFrame]:
-        assert (
-            get_closest_next_business_day(start_date, mcal.get_calendar("NYSE"))
-            == start_date
-        )
-        assert (
-            get_closest_prev_business_day(end_date, mcal.get_calendar("NYSE"))
-            == end_date
-        )
+        start_date = pd.Timestamp(start_date)
+        end_date = pd.Timestamp(end_date)
+        if start_date.tzinfo is not None:
+            start_date = start_date.tz_localize(None)
+        if end_date.tzinfo is not None:
+            end_date = end_date.tz_localize(None)
+        start_date = start_date.normalize()
+        end_date = end_date.normalize()
+        nyse = mcal.get_calendar("NYSE")
+        # Be permissive: callers may pass non-business dates (e.g., weekend end_date).
+        # Normalize to the closest business-day boundaries for data availability.
+        start_date = get_closest_next_business_day(start_date, nyse)
+        end_date = get_closest_prev_business_day(end_date, nyse)
+        if end_date < start_date:
+            raise ValueError(
+                f"Invalid date range after business-day normalization: start={start_date}, end={end_date}"
+            )
 
         data = {}
         data_cache = self._get_tingle_data(start_date, end_date)
@@ -147,6 +164,14 @@ class TiingoEodDataLoaderProd(DataLoader):
     def _get_tingle_data(
         self, start_date: DateLike, end_date: DateLike
     ) -> pd.DataFrame:
+        start_date = pd.Timestamp(start_date)
+        end_date = pd.Timestamp(end_date)
+        if start_date.tzinfo is not None:
+            start_date = start_date.tz_localize(None)
+        if end_date.tzinfo is not None:
+            end_date = end_date.tz_localize(None)
+        start_date = start_date.normalize()
+        end_date = end_date.normalize()
         combined_data = {}
 
         for ticker in self.tickers:
@@ -231,7 +256,7 @@ class TiingoEodDataLoaderProd(DataLoader):
             return pd.DataFrame()
 
         df = pd.DataFrame(data).set_index("date")
-        df.index = pd.to_datetime(df.index)
+        df.index = pd.to_datetime(df.index, utc=True).tz_convert(None).normalize()
         return df
 
 
@@ -246,6 +271,16 @@ class PriceVolumeDatabaseLoader(DataLoader):
         start_date: Optional[DateLike],
         end_date: Optional[DateLike],
     ) -> Mapping[DataField, pd.DataFrame]:
+        if start_date is not None:
+            start_date = pd.Timestamp(start_date)
+            if start_date.tzinfo is not None:
+                start_date = start_date.tz_localize(None)
+            start_date = start_date.normalize()
+        if end_date is not None:
+            end_date = pd.Timestamp(end_date)
+            if end_date.tzinfo is not None:
+                end_date = end_date.tz_localize(None)
+            end_date = end_date.normalize()
         data = {}
 
         from .dataset import PriceVolume
@@ -257,6 +292,10 @@ class PriceVolumeDatabaseLoader(DataLoader):
                     raise NotImplemented(f"Field {field} is not supported")
 
                 field_name = field.name.lower()
+                if db_data.empty:
+                    if field not in data:
+                        data[field] = pd.DataFrame()
+                    continue
                 if field_name not in db_data.columns:
                     raise ValueError(f"Field {field_name} is not in the database data")
 

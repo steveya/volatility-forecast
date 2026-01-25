@@ -1,9 +1,6 @@
 from .stes_model import STESModel
 from .tree_stes_model import XGBoostSTESModel
 
-# Backwards-compatible alias for the older implementation.
-from .xgboost_stes_model import XGBoostSTESModel as LegacyXGBoostSTESModel
-
 try:
     from .neural_network_model import (
         RNNVolatilityModel,

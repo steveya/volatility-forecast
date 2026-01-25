@@ -2,7 +2,7 @@ import pandas as pd
 from abc import ABCMeta
 from weakref import WeakValueDictionary
 from typing import Any, Optional, Union, Mapping, List, Type
-from datetime import datetime
+from datetime import datetime, date as date_type
 from toolz import first
 
 DateLike = Union[datetime, pd.Timestamp, str]
@@ -687,11 +687,15 @@ def ensure_timestamp(date: Optional[DateLike]) -> Optional[pd.Timestamp]:
         dt = pd.Timestamp(date)
     elif isinstance(date, pd.Timestamp):
         dt = date
+    elif isinstance(date, datetime):
+        dt = pd.Timestamp(date)
+    elif isinstance(date, date_type):
+        dt = pd.Timestamp(date)
     elif date is None:
         return None
     else:
         raise TypeError("Invalid date type")
-    
+
     if dt.tzinfo is None:
         dt = dt.tz_localize("UTC")
     return dt
@@ -704,8 +708,24 @@ class ParametrizedSingleton(ABCMeta):
 
     _instances = {}
 
+    @staticmethod
+    def _make_hashable(value):
+        if isinstance(value, list):
+            return tuple(ParametrizedSingleton._make_hashable(v) for v in value)
+        if isinstance(value, dict):
+            return frozenset(
+                (k, ParametrizedSingleton._make_hashable(v)) for k, v in value.items()
+            )
+        if isinstance(value, set):
+            return frozenset(ParametrizedSingleton._make_hashable(v) for v in value)
+        return value
+
     def __call__(cls, *args, **kwargs):
-        key = (cls, args, frozenset(kwargs.items()))
+        hashable_args = tuple(cls._make_hashable(a) for a in args)
+        hashable_kwargs = frozenset(
+            (k, cls._make_hashable(v)) for k, v in kwargs.items()
+        )
+        key = (cls, hashable_args, hashable_kwargs)
         if key not in cls._instances:
             cls._instances[key] = super(ParametrizedSingleton, cls).__call__(
                 *args, **kwargs

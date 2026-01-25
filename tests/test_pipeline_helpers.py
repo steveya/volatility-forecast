@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-import pytest
 from dataclasses import dataclass
 from typing import Dict
 
@@ -121,23 +120,3 @@ def test_nextday_squared_return_target_with_tiny_source(tmp_path):
     # Expect at least two non-NaNs for the next-day target in this short range
     assert ff.X.shape[1] == 1
     assert ff.X.notna().sum().sum() >= 2
-
-
-def test_xgb_accepts_pandas_inputs_if_available():
-    try:
-        import xgboost  # noqa: F401
-    except Exception:
-        pytest.skip("xgboost not available")
-
-    from volatility_forecast.model.xgboost_stes_model import XGBoostSTESModel
-
-    # small synthetic dataset
-    n = 50
-    X = pd.DataFrame({"f1": np.random.randn(n), "f2": np.random.randn(n)})
-    y = pd.Series(np.random.rand(n), name="y")
-
-    m = XGBoostSTESModel(max_depth=2, eta=0.1, subsample=0.8, colsample_bytree=0.8)
-    m.fit(X, y, start_index=0, end_index=n)
-    yhat = m.predict(X)
-    assert isinstance(yhat, np.ndarray)
-    assert yhat.shape[0] == n
