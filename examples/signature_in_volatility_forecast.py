@@ -78,6 +78,7 @@ from alphaforge.features.dataset_spec import (
     JoinPolicy,
     MissingnessPolicy,
 )
+from alphaforge.data.cache import FileCacheBackend
 from volatility_forecast.pipeline import (
     build_default_ctx,
     build_vol_dataset,
@@ -96,7 +97,6 @@ from volatility_forecast.model.es_model import ESModel
 from volatility_forecast.model.stes_model import STESModel
 from volatility_forecast.model.tree_stes_model import XGBoostSTESModel
 
-from volatility_forecast.evaluation import metrics
 from volatility_forecast.evaluation.model_evaluator import rmse, mae, medae
 
 
@@ -107,6 +107,9 @@ from volatility_forecast.evaluation.model_evaluator import rmse, mae, medae
 SPY_TICKER = "SPY"
 SPY_START = pd.Timestamp("2000-01-01", tz="UTC")
 SPY_END = pd.Timestamp("2023-12-31", tz="UTC")
+SPY_BDAYS = pd.bdate_range(SPY_START, SPY_END, tz="UTC")
+SPY_START_BDAY = SPY_BDAYS.min()
+SPY_END_BDAY = SPY_BDAYS.max()
 
 # Same as Part 2 script
 SPY_IS_INDEX = 200
@@ -121,87 +124,98 @@ INIT_WINDOW = 500
 
 
 # ---------------------------------------------------------------------------
-# XGBSTES defaults (copied from examples/volatility_forecast_2.py)
+# XGBSTES defaults (aligned with examples/volatility_forecast_2.py)
 # ---------------------------------------------------------------------------
 
-DEFAULT_XGBOOST_PARAMS: dict = {
-    "num_boost_round": 200,
-    "max_depth": 3,
-    "learning_rate": 0.05,  # mapped to XGBoost 'eta'
+XGB_PARAMS = {
+    "booster": "gblinear",
+    "updater": "coord_descent",
+    "max_depth": 5,
+    "learning_rate": 0.01,
     "subsample": 1.0,
     "colsample_bytree": 1.0,
     "min_child_weight": 1.0,
-    "reg_lambda": 1.0,  # mapped to XGBoost 'lambda'
-    "reg_alpha": 0.0,  # mapped to XGBoost 'alpha'
+    "reg_lambda": 1.0,
+    "reg_alpha": 0.0,
     "verbosity": 0,
-    "alt_objective": "reg:pseudohubererror",
-    "residual_mode": True,
-    "monotonic_constraints": {},
-    "denom_quantile": 0.05,
-    "min_denom_floor": 1e-12,
-    # XGBSTES specific knobs
-    "init_window": INIT_WINDOW,
-    "n_alt_iters": 3,
-    "alt_clip_eps": 1e-6,
 }
+XGB_ROUNDS = 200
 
-DEFAULT_XGBOOST_PARAMS = {
-    "tree_method": "hist",
-    "max_depth": 1,
-    "eta": 0.03,
-    "subsample": 0.7,
-    "colsample_bytree": 0.7,
-    "colsample_bylevel": 0.8,
-    "min_child_weight": 10.0,
-    "gamma": 0.05,
-    "lambda": 10.0,
-    "alpha": 0.5,
-    "verbosity": 0,
-}
+# Scale returns by 100 (Vol Points) so variance is scaled by 10000.
+# This keeps XGBoostSTES gradients well-conditioned.
+SCALE_FACTOR = 100.0
+
+
+def _read_tiingo_cache_dir() -> str:
+    return os.environ.get("TIINGO_CACHE_DIR", ".af_cache")
+
+
+def _ensure_spy_cache_coverage(cache: FileCacheBackend) -> None:
+    """Ensure SPY cache covers [SPY_START, SPY_END] to avoid API calls."""
+    cache_key = f"{SPY_TICKER}|adj=True"
+    cached = cache.get(cache_key)
+    if cached is None or cached.empty:
+        raise RuntimeError(
+            "Tiingo cache is empty for SPY. Populate cache first before running in cache-only mode."
+        )
+
+    dates = pd.to_datetime(cached["date"], utc=True).dt.normalize()
+    cached_min = dates.min()
+    cached_max = dates.max()
+
+    # Use business-day bounds to avoid false failures on weekends/holidays.
+    if SPY_BDAYS.empty:
+        raise RuntimeError("No business days found between SPY_START and SPY_END.")
+    target_min = SPY_START_BDAY
+    target_max = SPY_END_BDAY
+
+    if cached_min > target_min or cached_max < target_max:
+        raise RuntimeError(
+            "Tiingo cache does not fully cover SPY range. "
+            f"Cached [{cached_min.date()}..{cached_max.date()}], "
+            f"needed [{target_min.date()}..{target_max.date()}]."
+        )
+
+
+def make_xgbstes_grids():
+    """Define hyperparameter grids for CV (aligned with volatility_forecast_2.py)."""
+    grid_e2e = [
+        {"min_child_weight": 5.0, "learning_rate": 0.05, "max_depth": 3},
+        {"min_child_weight": 20.0, "learning_rate": 0.1, "max_depth": 3},
+        {"min_child_weight": 50.0, "learning_rate": 0.05, "max_depth": 2},
+    ]
+    return grid_e2e
 
 
 def _make_xgb_stes_model(
-    *, seed: int | None, params_flat: dict | None = None
+    *,
+    seed: int | None,
+    fit_method: str = "alternating",
+    loss: str = "mse",
+    xgb_params: dict | None = None,
+    monotonic_constraints: dict[str, int] | None = None,
 ) -> XGBoostSTESModel:
-    """Adapter from flat param dict to tree_stes_model.XGBoostSTESModel."""
-    flat = dict(DEFAULT_XGBOOST_PARAMS)
-    if params_flat:
-        flat.update(params_flat)
-
-    num_boost_round = int(flat.pop("num_boost_round", 200))
-    init_window = int(flat.pop("init_window", INIT_WINDOW))
-    n_alt_iters = int(flat.pop("n_alt_iters", 3))
-    alt_clip_eps = float(flat.pop("alt_clip_eps", 1e-6))
-
-    alt_objective = flat.pop("alt_objective", "reg:pseudohubererror")
-    residual_mode = bool(flat.pop("residual_mode", True))
-    monotonic_constraints = flat.pop("monotonic_constraints", {})
-    denom_quantile = float(flat.pop("denom_quantile", 0.05))
-    min_denom_floor = float(flat.pop("min_denom_floor", 1e-12))
-
-    xgb_params: dict = {}
-    for k, v in flat.items():
-        if k == "learning_rate":
-            xgb_params["eta"] = v
-        elif k == "reg_lambda":
-            xgb_params["lambda"] = v
-        elif k == "reg_alpha":
-            xgb_params["alpha"] = v
-        else:
-            xgb_params[k] = v
+    params = dict(XGB_PARAMS)
+    if xgb_params:
+        params.update(xgb_params)
+    # Keep E2E defaults aligned with examples/volatility_forecast_2.py
+    e2e_kwargs = {}
+    if fit_method == "end_to_end":
+        e2e_kwargs = {
+            "e2e_grad_hess_scale": 1.0,
+            "e2e_debug": True,
+            "e2e_debug_print_once": True,
+        }
 
     return XGBoostSTESModel(
-        xgb_params=xgb_params,
-        num_boost_round=num_boost_round,
-        init_window=init_window,
-        n_alt_iters=n_alt_iters,
-        alt_clip_eps=alt_clip_eps,
+        xgb_params=params,
+        num_boost_round=XGB_ROUNDS,
+        init_window=INIT_WINDOW,
+        fit_method=fit_method,  # "alternating" | "end_to_end"
+        loss=loss,  # "mse" | "pseudohuber"
         random_state=seed,
         monotonic_constraints=monotonic_constraints,
-        alt_objective=alt_objective,
-        residual_mode=residual_mode,
-        denom_quantile=denom_quantile,
-        min_denom_floor=min_denom_floor,
+        **e2e_kwargs,
     )
 
 
@@ -216,38 +230,12 @@ def _infer_monotone_constraints(cols: list[str]) -> dict[str, int]:
 
 
 def _xgb_variant_overrides(variant: str, cols: list[str]) -> dict:
-    """Match Part 2 variant behavior for XGBSTES_* names."""
-    base = {
-        "alt_objective": "reg:squarederror",
-        "residual_mode": False,
-        "monotonic_constraints": {},
-    }
-
-    if variant in {
-        "XGBSTES_BASE_HUBER",
-        "XGBSTES_BASE_MONO_HUBER",
-        "XGBSTES_BASE_HUBER_RESID",
-        "XGBSTES_BASE_MONO_HUBER_RESID",
-    }:
-        base["alt_objective"] = "reg:pseudohubererror"
-
-    if variant in {
-        "XGBSTES_BASE_RESID",
-        "XGBSTES_BASE_MONO_RESID",
-        "XGBSTES_BASE_HUBER_RESID",
-        "XGBSTES_BASE_MONO_HUBER_RESID",
-    }:
-        base["residual_mode"] = True
-
-    if variant in {
-        "XGBSTES_BASE_MONO",
-        "XGBSTES_BASE_MONO_HUBER",
-        "XGBSTES_BASE_MONO_RESID",
-        "XGBSTES_BASE_MONO_HUBER_RESID",
-    }:
-        base["monotonic_constraints"] = _infer_monotone_constraints(cols)
-
-    return base
+    """Translate legacy XGBSTES_* variant names into current constructor knobs."""
+    v = variant.upper()
+    fit_method = "end_to_end" if "E2E" in v or "END_TO_END" in v else "alternating"
+    loss = "pseudohuber" if "HUBER" in v else "mse"
+    mono = _infer_monotone_constraints(cols) if "MONO" in v else None
+    return {"fit_method": fit_method, "loss": loss, "monotonic_constraints": mono}
 
 
 # ---------------------------------------------------------------------------
@@ -293,6 +281,7 @@ class SignatureConfig:
     lookback: int
     level: int
     augmentations: list[str]
+    sig_tfm: str
 
 
 def build_spy_spec_baseline(lags: int = N_LAGS) -> VolDatasetSpec:
@@ -314,7 +303,11 @@ def build_spy_spec_baseline(lags: int = N_LAGS) -> VolDatasetSpec:
     return VolDatasetSpec(
         universe=UniverseSpec(entities=[SPY_TICKER]),
         time=TimeSpec(
-            start=SPY_START, end=SPY_END, calendar="XNYS", grid="B", asof=None
+            start=SPY_START_BDAY,
+            end=SPY_END_BDAY,
+            calendar="XNYS",
+            grid="B",
+            asof=None,
         ),
         features=features,
         target=target,
@@ -332,9 +325,14 @@ def build_spy_spec_with_signature(sig: SignatureConfig, lags: int = N_LAGS):
     sig_req = FeatureRequest(
         template=SignatureFeaturesTemplate(),
         params={
-            "lookback": int(sig.lookback),
+            "lags": int(sig.lookback),
             "sig_level": int(sig.level),
-            "augmentations": sig.augmentations,
+            "sig_tfm": str(sig.sig_tfm),
+            # SignatureFeaturesTemplate expects a *string* tag / ordered pipeline spec.
+            # Examples: "all", "none", "cumsum->basepoint->addtime->leadlag"
+            "augmentation_list": (
+                "none" if not sig.augmentations else "->".join(sig.augmentations)
+            ),
             "source": "tiingo",
             "table": "market.ohlcv",
             "price_col": "close",
@@ -358,7 +356,11 @@ def build_spy_spec_with_signature(sig: SignatureConfig, lags: int = N_LAGS):
     return VolDatasetSpec(
         universe=UniverseSpec(entities=[SPY_TICKER]),
         time=TimeSpec(
-            start=SPY_START, end=SPY_END, calendar="XNYS", grid="B", asof=None
+            start=SPY_START_BDAY,
+            end=SPY_END_BDAY,
+            calendar="XNYS",
+            grid="B",
+            asof=None,
         ),
         features=features,
         target=target,
@@ -495,7 +497,7 @@ def build_spy_dataset_with_signature(
 class ModelName(str, Enum):
     ES = "ES"
     STES_EAESE = "STES_EAESE"
-    XGBSTES_BASE_MONO_HUBER = "XGBSTES_BASE_MONO_HUBER"
+    XGBSTES_E2E = "XGBSTES_E2E"
 
 
 def _variant_name(variant: str | Enum) -> str:
@@ -557,11 +559,7 @@ def _make_model(
         return ESModel(random_state=seed) if seed is not None else ESModel()
     if variant_name.startswith("XGBSTES_"):
         over = _xgb_variant_overrides(variant_name, cols or [])
-        merged = dict(DEFAULT_XGBOOST_PARAMS)
-        merged.update(over)
-        if xgb_params:
-            merged.update(xgb_params)
-        return _make_xgb_stes_model(seed=seed, params_flat=merged)
+        return _make_xgb_stes_model(seed=seed, xgb_params=xgb_params, **over)
     # STES variants
     return STESModel(random_state=seed) if seed is not None else STESModel()
 
@@ -572,7 +570,7 @@ def _select_columns(
     """Select base columns for a variant, optionally adding extra columns (e.g. signatures)."""
     variant_name = _variant_name(variant)
     if variant_name.startswith("XGBSTES_"):
-        base_cols = select_variant_columns(X, "XGBSTES_BASE_MONO_HUBER")
+        base_cols = select_variant_columns(X, "XGBSTES_BASE")
         if not base_cols:
             base_cols = list(X.columns)
     else:
@@ -601,31 +599,25 @@ def _fit_predict_oos(
     seed: int | None = None,
     xgb_params: dict | None = None,
     extra_cols: list[str] | None = None,
-) -> tuple[pd.Index, np.ndarray]:
+    return_alpha: bool = False,
+) -> tuple[pd.Index, np.ndarray] | tuple[pd.Index, np.ndarray, pd.Series]:
     variant_name = _variant_name(variant)
     if variant_name.startswith("XGBSTES_"):
-        base_cols = select_variant_columns(X, "XGBSTES_BASE_MONO_HUBER")
-        if not base_cols:
-            base_cols = list(X.columns)
-
-        base_cols = _filter_signature_cols(base_cols)
-
-        cols = list(base_cols)
+        # Preserve column order to match volatility_forecast_2.py behavior.
+        # Baseline XGBSTES ignores signature columns; signature variants keep all columns.
         if extra_cols:
-            seen = set(cols)
-            cols = cols + [c for c in extra_cols if c not in seen]
+            cols = list(X.columns)
+        else:
+            cols = [c for c in X.columns if not _is_signature_col(c)]
 
         X_sel = X[cols]
         X_tr, X_te = _scale_train_test(X_sel, train_slice, test_slice)
         y_tr, r_tr = y.iloc[train_slice], r.iloc[train_slice]
         r_te = r.iloc[test_slice]
 
-        over = _xgb_variant_overrides(variant_name, base_cols)
-        params_flat = dict(DEFAULT_XGBOOST_PARAMS)
-        params_flat.update(over)
-        if xgb_params:
-            params_flat.update(xgb_params)
-        model = _make_xgb_stes_model(seed=seed, params_flat=params_flat)
+        over = _xgb_variant_overrides(variant_name, cols)
+        # Align with volatility_forecast_2.py: do not set random_state for XGBSTES
+        model = _make_xgb_stes_model(seed=None, xgb_params=xgb_params, **over)
     else:
         cols = _select_columns(X, variant_name, extra_cols=extra_cols)
         X_sel = X[cols]
@@ -637,18 +629,47 @@ def _fit_predict_oos(
         model = _make_model(variant_name, seed=seed, xgb_params=xgb_params, cols=cols)
 
     # Keep alignment consistent with Part 2: always pass returns and start/end indices.
-    model.fit(X_tr, y_tr, returns=r_tr, start_index=0, end_index=len(X_tr))
+    if variant_name.startswith("XGBSTES_"):
+        r_tr_scaled = r_tr * SCALE_FACTOR
+        y_tr_scaled = y_tr * (SCALE_FACTOR**2)
+        grid_e2e = make_xgbstes_grids()
+        model.fit(
+            X_tr,
+            y_tr_scaled,
+            returns=r_tr_scaled,
+            perform_cv=True,
+            cv_grid=grid_e2e,
+            cv_splits=3,
+            start_index=0,
+            end_index=len(X_tr),
+        )
+    else:
+        model.fit(X_tr, y_tr, returns=r_tr, start_index=0, end_index=len(X_tr))
+
     # IMPORTANT: warm-start OOS recursion by predicting on concatenated
     # [train + test] and slicing the test tail. This avoids "cold start"
     # of the variance state at the beginning of the OOS block.
     n_tr = len(X_tr)
     X_all = pd.concat([X_tr, X_te], axis=0)
     r_all = pd.concat([r_tr, r_te], axis=0)
-    y_hat_all = model.predict(X_all, returns=r_all)
+    if variant_name.startswith("XGBSTES_"):
+        r_all_scaled = r_all * SCALE_FACTOR
+        y_hat_all_scaled = model.predict(X_all, returns=r_all_scaled)
+        y_hat_all = np.asarray(y_hat_all_scaled, dtype=float) / (SCALE_FACTOR**2)
+        alpha_all = model.get_alphas(X_all)
+    else:
+        y_hat_all = model.predict(X_all, returns=r_all)
+        if isinstance(model, STESModel):
+            _yhat_vals, alpha_vals = model.predict_with_alpha(X_all, returns=r_all)
+            alpha_all = pd.Series(alpha_vals, index=X_all.index, name="alpha")
+        else:
+            alpha_val = getattr(model, "alpha_", np.nan)
+            alpha_all = pd.Series(alpha_val, index=X_all.index, name="alpha")
 
-    y_hat_all_arr = np.asarray(y_hat_all, dtype=float)
-    y_hat_arr = y_hat_all_arr[n_tr:]
+    y_hat_arr = np.asarray(y_hat_all, dtype=float)[n_tr:]
     keep = np.isfinite(y_hat_arr)
+    if return_alpha:
+        return X_te.index[keep], y_hat_arr[keep], alpha_all
     return X_te.index[keep], y_hat_arr[keep]
 
 
@@ -725,14 +746,15 @@ def _df_to_markdown_table(df: pd.DataFrame) -> str:
 
 
 def _make_blog_table(df: pd.DataFrame) -> pd.DataFrame:
-    return pd.DataFrame(
-        {
-            "Model": df["variant"],
-            "RMSE": df["rmse_mean"].map(_format_sci),
-            "MAE": df["mae_mean"].map(_format_sci),
-            "MedAE": df["medae_mean"].map(_format_sci),
-        }
-    )
+    data = {
+        "Model": df["variant"],
+        "RMSE": df["rmse_mean"].map(_format_sci),
+        "MAE": df["mae_mean"].map(_format_sci),
+        "MedAE": df["medae_mean"].map(_format_sci),
+    }
+    if "signature" in df.columns:
+        data = {"Signature": df["signature"], **data}
+    return pd.DataFrame(data)
 
 
 # ---------------------------------------------------------------------------
@@ -800,7 +822,7 @@ def main():
     parser.add_argument(
         "--base-variants",
         type=str,
-        default="ES,STES_EAESE,XGBSTES_BASE_MONO_HUBER",
+        default="ES,STES_EAESE,XGBSTES_E2E",
         help="Comma-separated baseline variants for the sanity-check table.",
     )
     parser.add_argument(
@@ -818,7 +840,27 @@ def main():
             "explicitly provide augmentations. Use 'none' for no extras."
         ),
     )
+    parser.add_argument(
+        "--sig-tfm",
+        type=str,
+        default="signature",
+        choices=["signature", "logsignature"],
+        help="Signature transform to use for all --sig configs.",
+    )
     args = parser.parse_args()
+
+    # Add default comparison signature configs only when none are provided.
+    default_sig_specs = [
+        "L10_L2:10:2:none",
+        "L20_L2:20:2:none",
+        "L40_L2:40:2:none",
+        "L20_L3:20:3:none",
+        "L40_L3:40:3:none",
+    ]
+    if args.sig is None:
+        args.sig = []
+    if not args.sig:
+        args.sig.extend(default_sig_specs)
 
     extra_augs_global = _parse_augmentations(args.augmentations)
     logger.info(
@@ -827,11 +869,14 @@ def main():
         extra_augs_global,
     )
 
-    api_key = os.environ.get("TIINGO_API")
-    if not api_key:
-        raise RuntimeError("TIINGO_API not set. Set it in .env to run SPY experiments.")
-
-    ctx = build_default_ctx(tiingo_api_key=api_key)
+    # Cache-only mode: avoid hitting Tiingo API.
+    cache = FileCacheBackend(Path(_read_tiingo_cache_dir()))
+    _ensure_spy_cache_coverage(cache)
+    ctx = build_default_ctx(
+        tiingo_api_key=None,
+        tiingo_cache_backends=[cache],
+        tiingo_cache_mode="use",
+    )
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -893,6 +938,7 @@ def main():
                     lookback=int(lookback),
                     level=int(level),
                     augmentations=sig_augs,
+                    sig_tfm=args.sig_tfm,
                 )
             )
         except Exception:
@@ -907,6 +953,7 @@ def main():
     # ------------------------------------------------------------------
     # 4) For each signature config: build aligned X, run baselines + signature variants
     # ------------------------------------------------------------------
+    all_sig_tables = []
     for sig in sig_cfgs:
         if sig.lookback > SPY_IS_INDEX:
             logger.warning(
@@ -937,14 +984,12 @@ def main():
 
         # Compose variants: baselines + versions that include signature columns
         stes_sig_name = f"{_variant_name(ModelName.STES_EAESE)}_SIG_{sig.name}"
-        xgb_sig_name = (
-            f"{_variant_name(ModelName.XGBSTES_BASE_MONO_HUBER)}_SIG_{sig.name}"
-        )
+        xgb_sig_name = f"{_variant_name(ModelName.XGBSTES_E2E)}_SIG_{sig.name}"
 
         variants = [
             _variant_name(ModelName.ES),
             _variant_name(ModelName.STES_EAESE),
-            _variant_name(ModelName.XGBSTES_BASE_MONO_HUBER),
+            _variant_name(ModelName.XGBSTES_E2E),
             stes_sig_name,
             xgb_sig_name,
         ]
@@ -960,7 +1005,7 @@ def main():
 
         def _eval_variant(v: str) -> str:
             es_name = _variant_name(ModelName.ES)
-            xgb_name = _variant_name(ModelName.XGBSTES_BASE_MONO_HUBER)
+            xgb_name = _variant_name(ModelName.XGBSTES_E2E)
             stes_name = _variant_name(ModelName.STES_EAESE)
             if v.startswith(es_name):
                 return es_name
@@ -972,6 +1017,7 @@ def main():
         # (We keep the reported name as-is.)
         def evaluate_with_aliases():
             rows = []
+            alpha_series = {}
             train_sl = slice(SPY_IS_INDEX, SPY_OS_INDEX)
             test_sl = slice(SPY_OS_INDEX, len(y_base))
 
@@ -980,9 +1026,10 @@ def main():
                 extra = extra_cols_by_variant.get(v)
 
                 rmses, maes, medaes = [], [], []
-                for seed in seeds:
+                for i, seed in enumerate(seeds):
                     try:
-                        idx_te, y_hat = _fit_predict_oos(
+                        want_alpha = i == 0
+                        res = _fit_predict_oos(
                             variant=base_v,
                             X=X_sig,
                             y=y_base,
@@ -991,7 +1038,13 @@ def main():
                             test_slice=test_sl,
                             seed=seed,
                             extra_cols=extra,
+                            return_alpha=want_alpha,
                         )
+                        if want_alpha:
+                            idx_te, y_hat, alpha_all = res
+                            alpha_series[v] = alpha_all
+                        else:
+                            idx_te, y_hat = res
                         y_true = y_base.loc[idx_te].values
                         rmses.append(rmse(y_true, y_hat))
                         maes.append(mae(y_true, y_hat))
@@ -1014,9 +1067,12 @@ def main():
                     }
                 )
 
-            return pd.DataFrame(rows).sort_values("rmse_mean")
+            return pd.DataFrame(rows).sort_values("rmse_mean"), alpha_series
 
-        tbl = evaluate_with_aliases()
+        tbl, alpha_series = evaluate_with_aliases()
+        tbl = tbl.copy()
+        tbl.insert(0, "signature", sig.name)
+        all_sig_tables.append(tbl)
         tbl.to_csv(out_dir / f"spy_fixed_split_{sig.name}.csv", index=False)
         (out_dir / f"spy_fixed_split_{sig.name}_blog.md").write_text(
             "<!-- generated by signature_in_volatility_forecast.py -->\n\n"
@@ -1024,7 +1080,22 @@ def main():
             encoding="utf-8",
         )
 
+        if alpha_series:
+            df_alpha = pd.concat(alpha_series, axis=1)
+            alpha_path = out_dir / f"spy_fixed_split_{sig.name}_alphas.csv"
+            df_alpha.to_csv(alpha_path)
+            logger.info(f"Saved alpha time series to {alpha_path}")
+
         logger.info("\n" + tbl.to_string(index=False))
+
+    if all_sig_tables:
+        df_all = pd.concat(all_sig_tables, axis=0, ignore_index=True)
+        df_all.to_csv(out_dir / "spy_fixed_split_all_signatures.csv", index=False)
+        (out_dir / "spy_fixed_split_all_signatures_blog.md").write_text(
+            "<!-- generated by signature_in_volatility_forecast.py -->\n\n"
+            + _df_to_markdown_table(_make_blog_table(df_all)),
+            encoding="utf-8",
+        )
 
 
 if __name__ == "__main__":

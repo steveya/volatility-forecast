@@ -42,7 +42,7 @@ class TestSignatureFeaturesTemplate(unittest.TestCase):
     def test_template_initialization(self):
         """Test that template initializes correctly."""
         self.assertEqual(self.template.name, "signature")
-        self.assertEqual(self.template.version, "2.0")
+        self.assertEqual(self.template.version, "2.1")
         self.assertIn("lags", self.template.param_space)
         self.assertIn("sig_level", self.template.param_space)
         self.assertIn("augmentation_list", self.template.param_space)
@@ -99,7 +99,7 @@ class TestSignatureFeaturesTemplate(unittest.TestCase):
 
         # Check metadata
         self.assertEqual(result.meta["template"], "signature")
-        self.assertEqual(result.meta["version"], "2.0")
+        self.assertEqual(result.meta["version"], "2.1")
 
     def test_augmentation_all(self):
         """Test signature features with all augmentations."""

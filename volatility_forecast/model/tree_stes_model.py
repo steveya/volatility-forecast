@@ -150,6 +150,7 @@ class XGBoostSTESModel(BaseVolatilityModel):
         self.output_mode_: Optional[OutputMode] = None
         self.init_var_: Optional[float] = None
         self.last_var_: Optional[float] = None
+        self.base_margin_: Optional[np.ndarray] = None
 
     # ---------------------------------------------------------------------
     # small utilities
@@ -332,6 +333,8 @@ class XGBoostSTESModel(BaseVolatilityModel):
         perform_cv: bool = False,
         cv_grid: Optional[Iterable[Dict[str, Any]]] = None,
         cv_splits: int = 5,
+        # Warm-start: provide baseline z-scores as base_margin
+        base_margin: Optional[np.ndarray] = None,
         **_: Any,
     ) -> "XGBoostSTESModel":
         self._check_xgb()
@@ -358,6 +361,22 @@ class XGBoostSTESModel(BaseVolatilityModel):
         r_fit = r_fit.loc[idx]
         if len(X_fit) < 10:
             raise ValueError("Not enough rows to fit XGBoostSTESModel.")
+
+        # Slice base_margin to match the fitted data range
+        base_margin_fit: Optional[np.ndarray] = None
+        if base_margin is not None:
+            bm = np.asarray(base_margin, dtype=float)
+            bm_slice = bm[start_index:end_index]
+            # If index intersection dropped rows, re-index via positional mapping
+            if len(bm_slice) == len(idx):
+                base_margin_fit = bm_slice
+            else:
+                # Fallback: assume base_margin aligns with X before slicing
+                base_margin_fit = bm_slice[: len(idx)]
+            logger.info(
+                "base_margin provided (len=%d). Using base_score=0.0.",
+                len(base_margin_fit),
+            )
 
         X_np = self._as_numpy(X_fit)
         y_np = np.asarray(y_fit.values, dtype=float)
@@ -426,6 +445,9 @@ class XGBoostSTESModel(BaseVolatilityModel):
                 "objective",
                 "reg:logistic" if self.loss == "mse" else "reg:pseudohubererror",
             )
+            # XGBoost ≥ 2.0 requires base_score ∈ (0,1) for reg:logistic.
+            if params.get("objective") == "reg:logistic":
+                params.setdefault("base_score", 0.5)
             booster = self._fit_alternating(
                 X_np=X_np,
                 y_np=y_np,
@@ -451,12 +473,16 @@ class XGBoostSTESModel(BaseVolatilityModel):
             )
         else:
             params.setdefault("objective", "reg:squarederror")  # ignored by custom obj
-            params["min_child_weight"] = 1e-8
-            params["reg_lambda"] = 1e-8
-            params["max_depth"] = 2
-            params["eta"] = 0.1
-            params["subsample"] = 1
-            params["colsample_bytree"] = 1
+            # Only apply relaxed defaults when CV has NOT already selected
+            # values for these keys.  Previously these were unconditional
+            # overwrites which silently discarded CV-tuned hyperparameters.
+            if params.get("booster", "gbtree") != "gblinear":
+                params.setdefault("min_child_weight", 1e-8)
+                params.setdefault("reg_lambda", 1e-8)
+                params.setdefault("max_depth", 2)
+                params.setdefault("eta", 0.1)
+            params.setdefault("subsample", 1)
+            params.setdefault("colsample_bytree", 1)
 
             booster = self._fit_end_to_end(
                 X_np=X_np,
@@ -465,6 +491,7 @@ class XGBoostSTESModel(BaseVolatilityModel):
                 init_var=init_var,
                 params=params,
                 feature_names=feature_names,
+                base_margin=base_margin_fit,
             )
             self.output_mode_ = "logit"
             self.fit_result_ = EndToEndFitResult(
@@ -481,8 +508,13 @@ class XGBoostSTESModel(BaseVolatilityModel):
 
         self.model_ = self.fit_result_.booster
 
+        # Store base_margin function for predict-time reconstruction
+        self.base_margin_: Optional[np.ndarray] = base_margin_fit
+
         # store warm-start terminal variance on the fit block
         d_all = xgb.DMatrix(X_np, feature_names=list(feature_names))
+        if base_margin_fit is not None:
+            d_all.set_base_margin(base_margin_fit)
         score = self.model_.predict(d_all)
         alpha_fit = (
             expit(score.astype(float))
@@ -688,6 +720,7 @@ class XGBoostSTESModel(BaseVolatilityModel):
         init_var: float,
         params: Dict[str, Any],
         feature_names: Tuple[str, ...],
+        base_margin: Optional[np.ndarray] = None,
     ) -> Any:
         # 1. Split Train/Valid for Early Stopping
         n = len(y_np)
@@ -721,6 +754,19 @@ class XGBoostSTESModel(BaseVolatilityModel):
 
         dtrain = xgb.DMatrix(X_tr, label=y_tr, feature_names=list(feature_names))
         dvalid = xgb.DMatrix(X_va, label=y_va, feature_names=list(feature_names))
+
+        # 4. Apply base_margin if provided (warm-start / two-stage)
+        if base_margin is not None:
+            bm_tr, bm_va = base_margin[:split], base_margin[split:]
+            dtrain.set_base_margin(bm_tr)
+            dvalid.set_base_margin(bm_va)
+            # Disable default base_score to avoid double-counting
+            params["base_score"] = 0.0
+            logger.info(
+                "[E2E] base_margin applied: train=%d, valid=%d",
+                len(bm_tr),
+                len(bm_va),
+            )
 
         booster = xgb.train(
             params=params,
@@ -764,6 +810,7 @@ class XGBoostSTESModel(BaseVolatilityModel):
         end_index: Optional[int] = None,
         init_var: Optional[float] = None,
         warm_start_from_last_fit: bool = True,
+        base_margin: Optional[np.ndarray] = None,
         **_: Any,
     ) -> pd.Series:
         self._check_xgb()
@@ -784,6 +831,10 @@ class XGBoostSTESModel(BaseVolatilityModel):
 
         feature_names = list(Xp.columns)
         dtest = xgb.DMatrix(X_np, feature_names=feature_names)
+        if base_margin is not None:
+            bm = np.asarray(base_margin, dtype=float)
+            bm_pred = bm[start_index:end_index][: len(Xp)]
+            dtest.set_base_margin(bm_pred)
         score = self.model_.predict(dtest)
         alpha = (
             expit(score.astype(float))
@@ -804,7 +855,12 @@ class XGBoostSTESModel(BaseVolatilityModel):
         return pd.Series(yhat, index=Xp.index, name="yhat")
 
     def get_alphas(
-        self, X: pd.DataFrame, *, start_index: int = 0, end_index: Optional[int] = None
+        self,
+        X: pd.DataFrame,
+        *,
+        start_index: int = 0,
+        end_index: Optional[int] = None,
+        base_margin: Optional[np.ndarray] = None,
     ) -> pd.Series:
         self._check_xgb()
         if self.model_ is None or self.output_mode_ is None:
@@ -814,6 +870,10 @@ class XGBoostSTESModel(BaseVolatilityModel):
 
         Xp = X.iloc[start_index:end_index]
         d = xgb.DMatrix(self._as_numpy(Xp), feature_names=list(Xp.columns))
+        if base_margin is not None:
+            bm = np.asarray(base_margin, dtype=float)
+            bm_pred = bm[start_index:end_index][: len(Xp)]
+            d.set_base_margin(bm_pred)
         score = self.model_.predict(d)
         alpha = (
             expit(score.astype(float))

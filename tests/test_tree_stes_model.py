@@ -362,7 +362,8 @@ class TestXGBoostSTESModelUtilities:
 
         loss_val = XGBoostSTESModel._loss_value(yhat, y, loss="mse", huber_delta=1.0)
 
-        expected = np.mean((yhat - y) ** 2)
+        # _loss_value uses ℓ(u) = 0.5 u² convention (consistent with gradient ℓ'=u)
+        expected = 0.5 * np.mean((yhat - y) ** 2)
         assert np.isclose(loss_val, expected)
 
     def test_loss_value_pseudohuber(self):

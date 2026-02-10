@@ -119,6 +119,7 @@ ipython_config.py
 # Local run artifacts
 outputs/
 .af_store/
+.af_cache/
 .af_store_demo/
 .tmpstore/
 reference/
