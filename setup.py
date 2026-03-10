@@ -16,7 +16,16 @@ setup(
         "Operating System :: OS Independent",
     ],
     python_requires=">=3.6",
-    install_requires=["numpy"],
+    install_requires=[
+        "numpy",
+        "pandas",
+        "scipy",
+        "scikit-learn",
+        "joblib",
+        "sqlalchemy",
+        "pandas-market-calendars",
+        "python-dotenv",
+    ],
     extras_require={
         "dev": ["pytest>=7.0"],
     },

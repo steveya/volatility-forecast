@@ -1,6 +1,10 @@
 import importlib.util
 import pathlib
 import pandas as pd
+import pytest
+
+pytest.importorskip("alphaforge")
+
 from alphaforge.data.query import Query
 
 # load module directly to avoid importing the top-level package which has heavy imports
