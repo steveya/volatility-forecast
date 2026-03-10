@@ -22,6 +22,7 @@ setup(
         "scipy",
         "scikit-learn",
         "joblib",
+        "requests",
         "sqlalchemy",
         "pandas-market-calendars",
         "python-dotenv",
