@@ -17,4 +17,7 @@ setup(
     ],
     python_requires=">=3.6",
     install_requires=["numpy"],
+    extras_require={
+        "dev": ["pytest>=7.0"],
+    },
 )
