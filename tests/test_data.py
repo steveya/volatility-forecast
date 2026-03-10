@@ -1,3 +1,4 @@
+import os
 import pandas as pd
 import pandas_market_calendars as mcal
 import numpy as np
@@ -53,6 +54,7 @@ class TestPriceVolume(unittest.TestCase):
         self.assertTrue(hasattr(PriceVolume, "CLOSE"))
         self.assertTrue(hasattr(PriceVolume, "VOLUME"))
 
+    @unittest.skipUnless(os.getenv("TIINGO_API"), "TIINGO_API not set")
     def test_get_data(self):
         data = PriceVolume.CLOSE.get_data(self.loader, "2021-01-01", "2021-01-10")
         self.assertEqual(len(data), 5)

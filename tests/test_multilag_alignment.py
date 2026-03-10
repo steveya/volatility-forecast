@@ -2,6 +2,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
+pytest.importorskip("alphaforge")
+
 from dataclasses import dataclass
 from typing import Dict
 

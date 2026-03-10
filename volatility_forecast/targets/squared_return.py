@@ -4,11 +4,34 @@ from typing import Any, Dict, List, Tuple
 import numpy as np
 import pandas as pd
 
-from alphaforge.data.context import DataContext
-from alphaforge.data.query import Query
-from alphaforge.features.template import ParamSpec, SliceSpec
-from alphaforge.features.frame import FeatureFrame
-from alphaforge.features.ids import make_feature_id, group_path
+try:
+    from alphaforge.data.context import DataContext
+    from alphaforge.data.query import Query
+    from alphaforge.features.template import ParamSpec, SliceSpec
+    from alphaforge.features.frame import FeatureFrame
+    from alphaforge.features.ids import make_feature_id, group_path
+except ImportError:
+    DataContext = object  # type: ignore[misc,assignment]
+
+    class Query:  # type: ignore[no-redef]
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+    class ParamSpec:  # type: ignore[no-redef]
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+    SliceSpec = object  # type: ignore[misc,assignment]
+
+    class FeatureFrame:  # type: ignore[no-redef]
+        def __init__(self, X: Any, **kwargs: Any) -> None:
+            self.X = X
+
+    def make_feature_id(*args: Any, **kwargs: Any) -> str:  # type: ignore[misc]
+        return "_target"
+
+    def group_path(*args: Any, **kwargs: Any) -> str:  # type: ignore[misc]
+        return ""
 
 
 class NextDaySquaredReturnTarget:

@@ -1,5 +1,8 @@
 import os
 import pandas as pd
+import pytest
+
+pytest.importorskip("alphaforge")
 
 from alphaforge.data.context import DataContext
 from alphaforge.time.calendar import TradingCalendar

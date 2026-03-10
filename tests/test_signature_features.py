@@ -5,7 +5,10 @@ Test suite for signature-based features using sktime's SignatureTransformer.
 import unittest
 import numpy as np
 import pandas as pd
+import pytest
 from datetime import datetime, timedelta
+
+pytest.importorskip("alphaforge")
 
 from volatility_forecast.features.signature_features import SignatureFeaturesTemplate
 from volatility_forecast.sources.simulated_garch import SimulatedGARCHSource
