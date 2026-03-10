@@ -59,16 +59,18 @@ import hashlib
 import json
 import logging
 import os
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
 
 import joblib
 import numpy as np
-from scipy.optimize import least_squares
+from scipy.optimize import least_squares, minimize
 from scipy.special import expit
 
 from .base_model import BaseVolatilityModel
 
 logger = logging.getLogger(__name__)
+
+LossName = Literal["mse", "qlike"]
 
 
 def _schema_hash(cols):
@@ -93,6 +95,10 @@ class STESModel(BaseVolatilityModel):
         L2 regularisation strength.  The penalty is applied to all parameters
         except the intercept (``const`` column) and is scaled by the norm of
         the target vector to remain unit-agnostic.
+    adaptive_weights : array-like or None
+        Per-feature penalty multipliers for adaptive LASSO.  When provided,
+        ``penalty_vec[j] = sqrt(l2_reg) * scale * mask[j] * adaptive_weights[j]``.
+        Use :meth:`compute_adaptive_weights` to derive these from a ridge pilot.
     keep_result : bool, default False
         If ``True``, the full :class:`scipy.optimize.OptimizeResult` is stored
         in ``self.result`` after fitting for diagnostic inspection.
@@ -122,14 +128,29 @@ class STESModel(BaseVolatilityModel):
         self,
         params=None,
         *,
+        loss: LossName = "mse",
         l2_reg: float = 0.0,
+        adaptive_weights=None,
+        qlike_epsilon: float = 1e-8,
         keep_result: bool = False,
         random_state: int | None = None,
     ):
+        if loss not in {"mse", "qlike"}:
+            raise ValueError("loss must be one of: {'mse','qlike'}")
+        if not (np.isfinite(qlike_epsilon) and qlike_epsilon > 0.0):
+            raise ValueError("qlike_epsilon must be finite and > 0")
+
         self.params = params
+        self.loss: LossName = loss
         self.keep_result = keep_result
         self.random_state = random_state
         self.l2_reg = float(l2_reg)
+        self.qlike_epsilon = float(qlike_epsilon)
+        self.adaptive_weights = (
+            np.asarray(adaptive_weights, dtype=float)
+            if adaptive_weights is not None
+            else None
+        )
 
         # Schema metadata (for safe reload + inference).
         self.feature_names_: list[str] | None = None
@@ -186,6 +207,29 @@ class STESModel(BaseVolatilityModel):
     # ------------------------------------------------------------------ #
     #  Objective and Jacobian                                              #
     # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _build_penalty_vec(
+        n_features: int,
+        feature_names: list[str] | None,
+        y_window: np.ndarray,
+        *,
+        l2_reg: float,
+        adaptive_weights: np.ndarray | None,
+    ) -> np.ndarray | None:
+        """Construct the smooth L2/adaptive-LASSO penalty vector."""
+        if l2_reg <= 0.0:
+            return None
+
+        mask = np.ones(n_features, dtype=float)
+        if feature_names and "const" in feature_names:
+            mask[feature_names.index("const")] = 0.0
+
+        scale = np.linalg.norm(y_window)
+        penalty_vec = np.sqrt(l2_reg) * scale * mask
+        if adaptive_weights is not None:
+            penalty_vec = penalty_vec * adaptive_weights
+        return penalty_vec
 
     @staticmethod
     def _objective(
@@ -250,6 +294,63 @@ class STESModel(BaseVolatilityModel):
         if penalty_vec is not None:
             return np.concatenate([res, penalty_vec * params])
         return res
+
+    @staticmethod
+    def _scalar_objective_and_grad(
+        params,
+        returns,
+        features,
+        y,
+        burnin_size,
+        os_index,
+        penalty_vec,
+        *,
+        loss: LossName,
+        qlike_epsilon: float,
+    ):
+        """Compute a scalar objective and analytical gradient.
+
+        This is used for losses that do not fit the residual-vector interface
+        required by ``scipy.optimize.least_squares``.
+        """
+        n, p = features.shape
+        alphas = expit(features @ params)
+        returns2 = returns**2
+
+        v = float(returns2[0])
+        d_v = np.zeros(p, dtype=float)
+
+        objective = 0.0
+        grad = np.zeros(p, dtype=float)
+
+        for t in range(n):
+            a = float(alphas[t])
+            innovation = float(returns2[t] - v)
+            d_vhat = a * (1.0 - a) * features[t] * innovation + (1.0 - a) * d_v
+            vhat = a * float(returns2[t]) + (1.0 - a) * v
+
+            if burnin_size <= t < os_index:
+                if loss == "mse":
+                    err = vhat - float(y[t])
+                    objective += 0.5 * err * err
+                    dloss_dvhat = err
+                else:
+                    y_safe = max(float(y[t]), qlike_epsilon)
+                    vhat_safe = max(float(vhat), qlike_epsilon)
+                    ratio = y_safe / vhat_safe
+                    objective += ratio - np.log(ratio) - 1.0
+                    dloss_dvhat = (vhat_safe - y_safe) / (vhat_safe * vhat_safe)
+
+                grad += dloss_dvhat * d_vhat
+
+            v = vhat
+            d_v = d_vhat
+
+        if penalty_vec is not None:
+            objective += 0.5 * np.sum((penalty_vec * params) ** 2)
+            grad += (penalty_vec**2) * params
+
+        return float(objective), grad
 
     @staticmethod
     def _jacobian(
@@ -349,6 +450,63 @@ class STESModel(BaseVolatilityModel):
 
         return jac
 
+    def _optimize_params(
+        self,
+        X_np: np.ndarray,
+        y_np: np.ndarray,
+        r_np: np.ndarray,
+        *,
+        start_index: int,
+        end_index: int,
+        penalty_vec: np.ndarray | None,
+        initial_params: np.ndarray | None = None,
+    ):
+        """Optimize STES parameters under the configured loss."""
+        if initial_params is None:
+            rng = np.random.default_rng(self.random_state)
+            initial_params = rng.normal(0, 1, size=X_np.shape[1])
+
+        common_args = (r_np, X_np, y_np, start_index, end_index, penalty_vec)
+
+        if self.loss == "mse":
+            return least_squares(
+                self._objective,
+                x0=initial_params,
+                jac=self._jacobian,
+                args=common_args,
+            )
+
+        def obj_and_grad(beta, *args):
+            return self._scalar_objective_and_grad(
+                beta,
+                *args,
+                loss=self.loss,
+                qlike_epsilon=self.qlike_epsilon,
+            )
+
+        return minimize(
+            obj_and_grad,
+            x0=initial_params,
+            args=common_args,
+            method="L-BFGS-B",
+            jac=True,
+            options={"maxiter": 500},
+        )
+
+    def _validation_score(self, y_true: np.ndarray, y_pred: np.ndarray) -> float:
+        """Compute the validation score associated with the configured loss."""
+        y_true = np.asarray(y_true, dtype=float)
+        y_pred = np.asarray(y_pred, dtype=float)
+
+        if self.loss == "mse":
+            err = y_true - y_pred
+            return float(np.mean(err * err))
+
+        y_true_safe = np.clip(y_true, self.qlike_epsilon, None)
+        y_pred_safe = np.clip(y_pred, self.qlike_epsilon, None)
+        ratio = y_true_safe / y_pred_safe
+        return float(np.mean(ratio - np.log(ratio) - 1.0))
+
     # ------------------------------------------------------------------ #
     #  Fit                                                                 #
     # ------------------------------------------------------------------ #
@@ -365,10 +523,12 @@ class STESModel(BaseVolatilityModel):
         cv_grid: Optional[Iterable[Dict[str, Any]]] = None,
         cv_splits: int = 5,
     ):
-        """Fit the STES model by non-linear least-squares optimisation.
+        """Fit the STES model under the configured training loss.
 
-        Uses ``scipy.optimize.least_squares`` with the analytical Jacobian
-        (see :meth:`_jacobian`) for efficient gradient computation.
+        For ``loss='mse'``, this uses ``scipy.optimize.least_squares`` with
+        the analytical Jacobian (see :meth:`_jacobian`). For scalar losses
+        such as ``loss='qlike'``, this uses ``scipy.optimize.minimize`` with
+        an analytical gradient.
 
         Parameters
         ----------
@@ -437,33 +597,52 @@ class STESModel(BaseVolatilityModel):
             if "l2_reg" in best_params:
                 self.l2_reg = float(best_params["l2_reg"])
 
+            # If adaptive LASSO won, compute weights on the full training set
+            if "adaptive_gamma" in best_params:
+                gamma = float(best_params["adaptive_gamma"])
+                # Fit a ridge pilot on the full training data
+                rng_pilot = np.random.default_rng(self.random_state)
+                x0_pilot = rng_pilot.normal(0, 1, size=X_np.shape[1])
+                pvec_pilot = self._build_penalty_vec(
+                    X_np.shape[1],
+                    self.feature_names_,
+                    y_np[start_index:end_index],
+                    l2_reg=self.l2_reg,
+                    adaptive_weights=None,
+                )
+                pilot = self._optimize_params(
+                    X_np,
+                    y_np,
+                    r_np,
+                    start_index=start_index,
+                    end_index=end_index,
+                    penalty_vec=pvec_pilot,
+                    initial_params=x0_pilot,
+                )
+                aw = self.compute_adaptive_weights(pilot.x, gamma=gamma)
+                if self.feature_names_ and "const" in self.feature_names_:
+                    aw[self.feature_names_.index("const")] = 0.0
+                self.adaptive_weights = aw
+
         rng = np.random.default_rng(self.random_state)
         initial_params = rng.normal(0, 1, size=X_np.shape[1])
 
-        # --- Construct Penalty Vector ---
-        penalty_vec = None
-        if self.l2_reg > 0.0:
-            # 1. Mask: Allow 'const' to evolve freely (avoid 0.5 bias)
-            mask = np.ones(X_np.shape[1], dtype=float)
-            if self.feature_names_ and "const" in self.feature_names_:
-                c_idx = self.feature_names_.index("const")
-                mask[c_idx] = 0.0
+        penalty_vec = self._build_penalty_vec(
+            X_np.shape[1],
+            self.feature_names_,
+            y_np[start_index:end_index],
+            l2_reg=self.l2_reg,
+            adaptive_weights=self.adaptive_weights,
+        )
 
-            # 2. Scale: Match magnitude of y (avoid 10^8 scale mismatch)
-            # Scale factor S = sqrt(sum(y^2)) / sqrt(N_features) approx?
-            # Actually, just matching the Frobenius norm of Y is a good heuristic
-            # to make lambda=1.0 meaningful relative to the total error sum.
-            scale = np.linalg.norm(y_np[start_index:end_index])
-
-            penalty_vec = np.sqrt(self.l2_reg) * scale * mask
-
-        # ----- Optimise with analytical Jacobian -----
-        common_args = (r_np, X_np, y_np, start_index, end_index, penalty_vec)
-        result = least_squares(
-            self._objective,
-            x0=initial_params,
-            jac=self._jacobian,
-            args=common_args,
+        result = self._optimize_params(
+            X_np,
+            y_np,
+            r_np,
+            start_index=start_index,
+            end_index=end_index,
+            penalty_vec=penalty_vec,
+            initial_params=initial_params,
         )
 
         self.params = result.x
@@ -565,12 +744,17 @@ class STESModel(BaseVolatilityModel):
         param_grid: Iterable[Dict[str, Any]],
         n_splits: int = 5,
     ) -> List[Tuple[float, Dict[str, Any]]]:
-        """Run time-series cross-validation to tune L2 regularisation.
+        """Run time-series cross-validation to tune regularisation.
 
         Uses ``TimeSeriesSplit`` from scikit-learn to create expanding-window
-        folds.  For each candidate ``l2_reg`` in *param_grid*, fits the STES
-        model on each training fold (using the analytical Jacobian) and
-        evaluates MSE on the validation fold.
+        folds. For each candidate in *param_grid*, fits the STES model on
+        each training fold and evaluates the configured training loss on the
+        validation fold.
+
+        Adaptive LASSO is supported: when a grid entry contains
+        ``"adaptive_gamma"``, a ridge pilot is first fit within each fold
+        and used to compute per-feature penalty weights via
+        :meth:`compute_adaptive_weights`.
 
         Parameters
         ----------
@@ -578,14 +762,15 @@ class STESModel(BaseVolatilityModel):
         y_np : ndarray, shape (T,)
         returns : ndarray, shape (T,)
         param_grid : iterable of dict
-            Each dict must contain ``"l2_reg"`` (float).
+            Each dict must contain ``"l2_reg"`` (float).  Optionally include
+            ``"adaptive_gamma"`` (float) to enable adaptive LASSO.
         n_splits : int, default 5
 
         Returns
         -------
         results : list of (float, dict)
-            Sorted by ascending MSE.  Each entry is
-            ``(mean_mse, params_dict)``.
+            Sorted by ascending validation loss. Each entry is
+            ``(mean_loss, params_dict)``.
         """
         from sklearn.model_selection import TimeSeriesSplit
 
@@ -602,6 +787,7 @@ class STESModel(BaseVolatilityModel):
 
         for params_cand in param_grid:
             l2 = float(params_cand.get("l2_reg", 0.0))
+            adaptive_gamma = params_cand.get("adaptive_gamma", None)
             fold_scores = []
 
             for train_idx, valid_idx in tscv.split(X_np):
@@ -617,17 +803,44 @@ class STESModel(BaseVolatilityModel):
                 )
 
                 # Penalty Scale (computed on Training fold)
-                scale_tr = np.linalg.norm(y_tr)
-                p_vec_tr = np.sqrt(l2) * scale_tr * mask if l2 > 0 else None
+                p_vec_tr = self._build_penalty_vec(
+                    X_tr.shape[1],
+                    self.feature_names_,
+                    y_tr,
+                    l2_reg=l2,
+                    adaptive_weights=None,
+                )
 
-                # Fit (with analytical Jacobian)
+                # Adaptive LASSO: fit ridge pilot, then reweight penalty
+                if adaptive_gamma is not None and p_vec_tr is not None:
+                    rng_pilot = np.random.default_rng(self.random_state)
+                    x0_pilot = rng_pilot.normal(0, 1, size=X_tr.shape[1])
+                    pilot = self._optimize_params(
+                        X_tr,
+                        y_tr,
+                        r_tr,
+                        start_index=0,
+                        end_index=len(X_tr),
+                        penalty_vec=p_vec_tr,
+                        initial_params=x0_pilot,
+                    )
+                    aw = self.compute_adaptive_weights(pilot.x, gamma=adaptive_gamma)
+                    # Zero out intercept weight
+                    if self.feature_names_ and "const" in self.feature_names_:
+                        aw[self.feature_names_.index("const")] = 0.0
+                    p_vec_tr = p_vec_tr * aw
+
+                # Fit on the fold
                 rng = np.random.default_rng(self.random_state)
                 x0 = rng.normal(0, 1, size=X_tr.shape[1])
-                res = least_squares(
-                    self._objective,
-                    x0=x0,
-                    jac=self._jacobian,
-                    args=(r_tr, X_tr, y_tr, 0, len(X_tr), p_vec_tr),
+                res = self._optimize_params(
+                    X_tr,
+                    y_tr,
+                    r_tr,
+                    start_index=0,
+                    end_index=len(X_tr),
+                    penalty_vec=p_vec_tr,
+                    initial_params=x0,
                 )
                 beta_hat = res.x
 
@@ -645,14 +858,48 @@ class STESModel(BaseVolatilityModel):
                     yhat_va[t] = v_next
                     v_curr = v_next
 
-                mse = np.mean((y_va - yhat_va) ** 2)
-                fold_scores.append(mse)
+                fold_scores.append(self._validation_score(y_va, yhat_va))
 
             avg_score = np.mean(fold_scores)
             results.append((avg_score, params_cand))
 
         results.sort(key=lambda x: x[0])
         return results
+
+    # ------------------------------------------------------------------ #
+    #  Adaptive LASSO utilities                                            #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def compute_adaptive_weights(
+        ridge_params: np.ndarray,
+        *,
+        gamma: float = 1.0,
+        eps: float = 1e-6,
+    ) -> np.ndarray:
+        """Compute adaptive LASSO weights from a ridge pilot estimate.
+
+        Returns per-parameter penalty multipliers
+        :math:`w_j = 1 / \\max(|\\hat\\beta_j^{\\text{ridge}}|, \\varepsilon)^\\gamma`.
+
+        Parameters
+        ----------
+        ridge_params : ndarray, shape (p,)
+            Parameter estimates from a ridge (L2-only) fit.
+        gamma : float, default 1.0
+            Exponent controlling selection aggressiveness.  Higher values
+            penalise small coefficients more heavily (e.g., 2.0 is more
+            aggressive than 1.0).
+        eps : float, default 1e-6
+            Floor on ``|beta_j|`` to prevent blow-up near zero.
+
+        Returns
+        -------
+        weights : ndarray, shape (p,)
+            Adaptive penalty multipliers.
+        """
+        abs_beta = np.abs(np.asarray(ridge_params, dtype=float))
+        return 1.0 / np.maximum(abs_beta, eps) ** gamma
 
     # ------------------------------------------------------------------ #
     #  Persistence                                                         #

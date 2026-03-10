@@ -72,7 +72,7 @@ class TestXGBoostSTESModelBasics:
             num_boost_round=100,
             init_window=250,
             fit_method="end_to_end",
-            loss="pseudohuber",
+            loss="qlike",
             huber_delta=2.0,
             n_alt_iters=5,
             gate_valid_frac=0.15,
@@ -82,7 +82,7 @@ class TestXGBoostSTESModelBasics:
         assert model.num_boost_round == 100
         assert model.init_window == 250
         assert model.fit_method == "end_to_end"
-        assert model.loss == "pseudohuber"
+        assert model.loss == "qlike"
         assert model.huber_delta == 2.0
         assert model.n_alt_iters == 5
         assert model.gate_valid_frac == 0.15
@@ -158,6 +158,24 @@ class TestXGBoostSTESModelFitAlternating:
         assert isinstance(model.fit_result_, AlternatingFitResult)
         assert model.fit_result_.loss == "pseudohuber"
         assert model.fit_result_.huber_delta == 1.5
+
+    def test_fit_alternating_qlike(self):
+        """Test fitting with alternating method and QLIKE loss."""
+        X, y, returns = make_dummy_data(n=300, seed=21)
+
+        model = XGBoostSTESModel(
+            num_boost_round=50,
+            fit_method="alternating",
+            loss="qlike",
+            n_alt_iters=2,
+            random_state=42,
+        )
+
+        model.fit(X, y, returns=returns, start_index=0, end_index=250)
+
+        assert model.model_ is not None
+        assert isinstance(model.fit_result_, AlternatingFitResult)
+        assert model.fit_result_.loss == "qlike"
 
     def test_predict_after_alternating_fit(self):
         """Test prediction after fitting with alternating method."""
@@ -249,6 +267,23 @@ class TestXGBoostSTESModelFitEndToEnd:
         assert isinstance(model.fit_result_, EndToEndFitResult)
         assert model.fit_result_.loss == "pseudohuber"
         assert model.fit_result_.huber_delta == 2.0
+
+    def test_fit_end_to_end_qlike(self):
+        """Test fitting with end-to-end method and QLIKE loss."""
+        X, y, returns = make_dummy_data(n=300, seed=22)
+
+        model = XGBoostSTESModel(
+            num_boost_round=50,
+            fit_method="end_to_end",
+            loss="qlike",
+            random_state=42,
+        )
+
+        model.fit(X, y, returns=returns, start_index=0, end_index=250)
+
+        assert model.model_ is not None
+        assert isinstance(model.fit_result_, EndToEndFitResult)
+        assert model.fit_result_.loss == "qlike"
 
     def test_predict_after_end_to_end_fit(self):
         """Test prediction after fitting with end-to-end method."""
@@ -355,6 +390,20 @@ class TestXGBoostSTESModelUtilities:
         assert np.isfinite(w).all()
         assert (w > 0).all()
 
+    def test_loss_derivs_qlike(self):
+        """Test QLIKE loss derivatives."""
+        yhat = np.array([0.1, 0.2, 0.3])
+        y = np.array([0.15, 0.18, 0.35])
+
+        e, w = XGBoostSTESModel._loss_derivs(yhat, y, loss="qlike", huber_delta=1.0)
+
+        expected_e = (yhat - y) / (yhat**2)
+        expected_w = (2.0 * y - yhat) / (yhat**3)
+
+        assert np.allclose(e, expected_e)
+        assert np.allclose(w, expected_w)
+        assert (w > 0).all()
+
     def test_loss_value_mse(self):
         """Test MSE loss value calculation."""
         yhat = np.array([0.1, 0.2, 0.3])
@@ -378,6 +427,17 @@ class TestXGBoostSTESModelUtilities:
         # Should be finite and non-negative
         assert np.isfinite(loss_val)
         assert loss_val >= 0
+
+    def test_loss_value_qlike(self):
+        """Test QLIKE loss value calculation."""
+        yhat = np.array([0.1, 0.2, 0.3])
+        y = np.array([0.15, 0.18, 0.35])
+
+        loss_val = XGBoostSTESModel._loss_value(yhat, y, loss="qlike", huber_delta=1.0)
+
+        ratio = y / yhat
+        expected = np.mean(ratio - np.log(ratio) - 1.0)
+        assert np.isclose(loss_val, expected)
 
 
 @pytest.mark.skipif(not HAS_XGBOOST, reason="xgboost not installed")

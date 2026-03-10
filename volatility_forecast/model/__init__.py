@@ -1,5 +1,6 @@
 from .stes_model import STESModel
 from .tree_stes_model import XGBoostSTESModel
+from .volgru_model import VolGRUModel
 
 try:
     from .neural_network_model import (

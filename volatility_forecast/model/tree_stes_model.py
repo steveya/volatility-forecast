@@ -53,7 +53,7 @@ from .base_model import BaseVolatilityModel
 logger = logging.getLogger(__name__)
 
 FitMethod = Literal["alternating", "end_to_end"]
-LossName = Literal["mse", "pseudohuber"]
+LossName = Literal["mse", "pseudohuber", "qlike"]
 OutputMode = Literal["alpha", "logit"]
 
 
@@ -96,6 +96,7 @@ class XGBoostSTESModel(BaseVolatilityModel):
         # shared loss (used for α* (alternating) and end-to-end objective)
         loss: LossName = "mse",
         huber_delta: float = 1.0,
+        qlike_epsilon: float = 1e-8,
         # end-to-end diagnostics / numerics
         e2e_grad_hess_scale: float = 1.0,
         e2e_debug: bool = False,
@@ -119,10 +120,12 @@ class XGBoostSTESModel(BaseVolatilityModel):
 
         if fit_method not in {"alternating", "end_to_end"}:
             raise ValueError("fit_method must be one of: {'alternating','end_to_end'}")
-        if loss not in {"mse", "pseudohuber"}:
-            raise ValueError("loss must be one of: {'mse','pseudohuber'}")
+        if loss not in {"mse", "pseudohuber", "qlike"}:
+            raise ValueError("loss must be one of: {'mse','pseudohuber','qlike'}")
         if not (np.isfinite(huber_delta) and huber_delta > 0.0):
             raise ValueError("huber_delta must be finite and > 0")
+        if not (np.isfinite(qlike_epsilon) and qlike_epsilon > 0.0):
+            raise ValueError("qlike_epsilon must be finite and > 0")
         if not (np.isfinite(e2e_grad_hess_scale) and e2e_grad_hess_scale > 0.0):
             raise ValueError("e2e_grad_hess_scale must be finite and > 0")
 
@@ -133,6 +136,7 @@ class XGBoostSTESModel(BaseVolatilityModel):
 
         self.loss: LossName = loss
         self.huber_delta = float(huber_delta)
+        self.qlike_epsilon = float(qlike_epsilon)
 
         self.e2e_grad_hess_scale = float(e2e_grad_hess_scale)
         self.e2e_debug = bool(e2e_debug)
@@ -184,12 +188,11 @@ class XGBoostSTESModel(BaseVolatilityModel):
     ) -> None:
         if not constraints:
             return
-        cons = [0] * len(feature_names)
-        name_to_idx = {n: i for i, n in enumerate(feature_names)}
-        for k, v in constraints.items():
-            if k in name_to_idx:
-                cons[name_to_idx[k]] = int(v)
-        params["monotone_constraints"] = tuple(cons)
+        params["monotone_constraints"] = {
+            name: int(direction)
+            for name, direction in constraints.items()
+            if name in set(feature_names)
+        }
 
     # ---------------------------------------------------------------------
     # recursion + loss helpers
@@ -224,6 +227,7 @@ class XGBoostSTESModel(BaseVolatilityModel):
         *,
         loss: LossName,
         huber_delta: float,
+        qlike_epsilon: float = 1e-8,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Return elementwise (e, w) where:
 
@@ -237,6 +241,12 @@ class XGBoostSTESModel(BaseVolatilityModel):
         u = (yhat - y).astype(float)
         if loss == "mse":
             return u, np.ones_like(u, dtype=float)
+        if loss == "qlike":
+            y_safe = np.maximum(np.asarray(y, dtype=float), qlike_epsilon)
+            yhat_safe = np.maximum(np.asarray(yhat, dtype=float), qlike_epsilon)
+            e = (yhat_safe - y_safe) / (yhat_safe**2)
+            w = (2.0 * y_safe - yhat_safe) / (yhat_safe**3)
+            return e, w
         d = float(huber_delta)
         s = np.sqrt(1.0 + (u / d) ** 2)
         e = u / s
@@ -245,13 +255,23 @@ class XGBoostSTESModel(BaseVolatilityModel):
 
     @staticmethod
     def _loss_value(
-        yhat: np.ndarray, y: np.ndarray, *, loss: LossName, huber_delta: float
+        yhat: np.ndarray,
+        y: np.ndarray,
+        *,
+        loss: LossName,
+        huber_delta: float,
+        qlike_epsilon: float = 1e-8,
     ) -> float:
         u = (yhat - y).astype(float)
         if loss == "mse":
             # Keep reporting consistent with _loss_derivs convention:
             # ℓ(u) = 0.5 * u^2  =>  dℓ/du = u, d²ℓ/du² = 1
             return float(0.5 * np.mean(u * u))
+        if loss == "qlike":
+            y_safe = np.maximum(np.asarray(y, dtype=float), qlike_epsilon)
+            yhat_safe = np.maximum(np.asarray(yhat, dtype=float), qlike_epsilon)
+            ratio = y_safe / yhat_safe
+            return float(np.mean(ratio - np.log(ratio) - 1.0))
         d = float(huber_delta)
         return float(np.mean(d * d * (np.sqrt(1.0 + (u / d) ** 2) - 1.0)))
 
@@ -288,7 +308,7 @@ class XGBoostSTESModel(BaseVolatilityModel):
             a = float((y[t] - v) / denom)
             a = float(np.clip(a, 0.0, 1.0))
 
-            if self.loss == "mse":
+            if self.loss in {"mse", "qlike"}:
                 out[t] = a
                 continue
 
@@ -302,6 +322,7 @@ class XGBoostSTESModel(BaseVolatilityModel):
                     np.asarray([y[t]]),
                     loss=self.loss,
                     huber_delta=self.huber_delta,
+                    qlike_epsilon=self.qlike_epsilon,
                 )
                 g = float(e[0]) * denom
                 h = float(w[0]) * (denom * denom)
@@ -443,7 +464,11 @@ class XGBoostSTESModel(BaseVolatilityModel):
         if self.fit_method == "alternating":
             params.setdefault(
                 "objective",
-                "reg:logistic" if self.loss == "mse" else "reg:pseudohubererror",
+                (
+                    "reg:logistic"
+                    if self.loss in {"mse", "qlike"}
+                    else "reg:pseudohubererror"
+                ),
             )
             # XGBoost ≥ 2.0 requires base_score ∈ (0,1) for reg:logistic.
             if params.get("objective") == "reg:logistic":
@@ -620,7 +645,11 @@ class XGBoostSTESModel(BaseVolatilityModel):
             yhat = v[1:]
 
             e_next, w_next = self._loss_derivs(
-                yhat, y, loss=loss, huber_delta=huber_delta
+                yhat,
+                y,
+                loss=loss,
+                huber_delta=huber_delta,
+                qlike_epsilon=self.qlike_epsilon,
             )
 
             g = np.zeros(n + 1, dtype=float)
@@ -706,7 +735,11 @@ class XGBoostSTESModel(BaseVolatilityModel):
                 v = v + float(alpha[t]) * (float(returns2[t]) - v)
                 yhat[t] = v
             return f"{loss}_e2e", self._loss_value(
-                yhat, y, loss=loss, huber_delta=huber_delta
+                yhat,
+                y,
+                loss=loss,
+                huber_delta=huber_delta,
+                qlike_epsilon=self.qlike_epsilon,
             )
 
         return obj, feval
@@ -940,7 +973,9 @@ class XGBoostSTESModel(BaseVolatilityModel):
             p.update(params_cand)
             # Match the logic in fit():
             p["objective"] = (
-                "reg:logistic" if self.loss == "mse" else "reg:pseudohubererror"
+                "reg:logistic"
+                if self.loss in {"mse", "qlike"}
+                else "reg:pseudohubererror"
             )
 
             fold_scores = []
@@ -972,8 +1007,13 @@ class XGBoostSTESModel(BaseVolatilityModel):
                 # Run filter with predicted alphas
                 _, yhat = self._filter_state_and_forecast(r2_va, alpha_pred, v0_va)
 
-                # E. Score (MSE of Variance Forecast)
-                fold_loss = np.mean((yhat - y_va) ** 2)
+                fold_loss = self._loss_value(
+                    yhat,
+                    y_va,
+                    loss=self.loss,
+                    huber_delta=self.huber_delta,
+                    qlike_epsilon=self.qlike_epsilon,
+                )
                 fold_scores.append(fold_loss)
 
             avg_score = np.mean(fold_scores)

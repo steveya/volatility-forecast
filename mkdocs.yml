@@ -1,0 +1,47 @@
+site_name: Volatility Forecast
+site_description: Deep Learning and Statistical Models for Volatility Forecasting
+site_author: Steve Yang
+
+theme:
+  name: material
+  features:
+    - navigation.tabs
+    - navigation.indexes
+    - navigation.instant
+    - toc.integrate
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+
+plugins:
+  - search
+
+markdown_extensions:
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences
+  - pymdownx.arithmatex:
+      generic: true
+  - admonition
+  - def_list
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - Design Decisions:
+    - Training Protocol: design_decisions/training_protocol.md
