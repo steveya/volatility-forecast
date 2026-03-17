@@ -19,17 +19,15 @@ from .volgru_utils import (
     _coerce_X,
     _set_schema,
     align_returns_next,
-    gate_entropy_term_jax,
+    feature_group_penalty_torch,
     gate_entropy_term_torch,
-    jax_adam_init,
-    jax_adam_update,
-    nll_gaussian_jax,
     nll_gaussian_torch,
+    qlike_torch,
 )
 
 
 class VolGRUModel(BaseVolatilityModel):
-    """Configurable GRU-style volatility model with torch/jax backends."""
+    """Configurable GRU-style volatility model (torch backend)."""
 
     def __init__(
         self,
@@ -61,8 +59,6 @@ class VolGRUModel(BaseVolatilityModel):
             )
 
     def _ensure_torch_module(self, n_features: int) -> None:
-        if self.config.backend != "torch":
-            return
         try:
             import torch
         except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
@@ -76,7 +72,7 @@ class VolGRUModel(BaseVolatilityModel):
             self.torch_module_ = VolGRUModelTorch(
                 config=self.config,
                 n_features=n_features,
-                dtype=torch.float64,
+                dtype=torch.float32,
             )
             return
         if int(self.torch_module_.n_features) != int(n_features):
@@ -85,40 +81,10 @@ class VolGRUModel(BaseVolatilityModel):
                 f"{self.torch_module_.n_features} vs {n_features}"
             )
 
-    def _ensure_jax_params(self, n_features: int) -> None:
-        if self.config.backend != "jax":
-            return
-        from .volgru_jax import init_params_jax
-
-        if self.params_ is not None:
-            gate = self.params_.get("gate", {})
-            beta = gate.get("beta", None)
-            if beta is not None and int(np.asarray(beta).shape[0]) != int(n_features):
-                raise ValueError(
-                    "Feature count mismatch with existing jax params: "
-                    f"{np.asarray(beta).shape[0]} vs {n_features}"
-                )
-            return
-
-        try:
-            import jax
-        except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
-            raise ImportError("jax is required for backend='jax'.") from exc
-
-        key = jax.random.PRNGKey(0 if self.random_state is None else int(self.random_state))
-        self.params_ = init_params_jax(self.config, n_features=n_features, key=key)
-
     def _backend_feature_count(self) -> int | None:
-        if self.config.backend == "torch":
-            if self.torch_module_ is None:
-                return None
-            return int(self.torch_module_.n_features)
-        if self.params_ is None:
+        if self.torch_module_ is None:
             return None
-        beta = self.params_.get("gate", {}).get("beta")
-        if beta is None:
-            return None
-        return int(np.asarray(beta).shape[0])
+        return int(self.torch_module_.n_features)
 
     def set_gate_beta(self, beta: np.ndarray) -> "VolGRUModel":
         """Set gate beta explicitly (useful for STES reduction tests)."""
@@ -130,54 +96,22 @@ class VolGRUModel(BaseVolatilityModel):
         else:
             raise ValueError(f"beta must be 1D or 2D. Got shape {beta_np.shape}")
 
-        if self.config.backend == "torch":
-            self._ensure_torch_module(n_features=n_features)
-            assert self.torch_module_ is not None
-            import torch
+        self._ensure_torch_module(n_features=n_features)
+        assert self.torch_module_ is not None
+        import torch
 
-            beta_t = torch.as_tensor(beta_np, dtype=torch.float64)
-            self.torch_module_.set_gate_beta(beta_t)
-            return self
-
-        if self.config.backend == "jax":
-            self._ensure_jax_params(n_features=n_features)
-            assert self.params_ is not None
-            try:
-                import jax.numpy as jnp
-            except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
-                raise ImportError("jax is required for backend='jax'.") from exc
-
-            gate = dict(self.params_["gate"])
-            beta_jnp = jnp.asarray(beta_np, dtype=jnp.float64)
-            if beta_jnp.ndim == 1:
-                beta_jnp = jnp.repeat(beta_jnp[:, None], int(self.config.state_dim), axis=1)
-            elif beta_jnp.shape != (n_features, int(self.config.state_dim)):
-                raise ValueError(
-                    "beta shape mismatch: expected "
-                    f"({n_features}, {int(self.config.state_dim)}), got {beta_jnp.shape}"
-                )
-            gate["beta"] = beta_jnp
-            params = dict(self.params_)
-            params["gate"] = gate
-            self.params_ = params
-            return self
-
-        raise ValueError(f"Unsupported backend={self.config.backend!r}")
+        beta_t = torch.as_tensor(beta_np, dtype=torch.float32)
+        self.torch_module_.set_gate_beta(beta_t)
+        return self
 
     def get_gate_beta(self) -> np.ndarray:
         """Get current gate beta vector."""
-        if self.config.backend == "torch":
-            if self.torch_module_ is None:
-                raise ValueError("Model not initialized. Call fit() or set_gate_beta() first.")
-            beta_t = self.torch_module_.get_gate_beta()
-            return beta_t.detach().cpu().numpy()
-
-        if self.config.backend == "jax":
-            if self.params_ is None:
-                raise ValueError("Model not initialized. Call fit() or set_gate_beta() first.")
-            return np.asarray(self.params_["gate"]["beta"], dtype=float)
-
-        raise ValueError(f"Unsupported backend={self.config.backend!r}")
+        if self.torch_module_ is None:
+            raise ValueError(
+                "Model not initialized. Call fit() or set_gate_beta() first."
+            )
+        beta_t = self.torch_module_.get_gate_beta()
+        return beta_t.detach().cpu().numpy()
 
     def fit(
         self,
@@ -272,13 +206,18 @@ class VolGRUModel(BaseVolatilityModel):
                 beta_ref=beta_ref_np,
             )
             best_score, avg_epochs, best_params = cv_results[0]
-            logger.info("VolGRU CV complete. Best MSE=%.6e, avg_epochs=%d, params=%s", best_score, avg_epochs, best_params)
+            logger.info(
+                "VolGRU CV complete. Best score=%.6e, avg_epochs=%d, params=%s",
+                best_score,
+                avg_epochs,
+                best_params,
+            )
 
             # Apply winning hyperparameters to self.config
             for key, val in best_params.items():
                 if key in self._CV_TUNABLE_FIELDS:
                     setattr(self.config, key, val)
-                    
+
             # Mirror XGBoost CV styling: apply the average stopping limit from CV
             # then run on 100% of data (val_fraction=0) to be comparable with STES framework.
             self.config.val_fraction = 0.0
@@ -293,30 +232,19 @@ class VolGRUModel(BaseVolatilityModel):
         r_block = r_np[:end_index]
         init_var_fit = float(r_block[0] ** 2) if init_var is None else float(init_var)
 
-        if self.config.backend == "torch":
-            self._ensure_torch_module(n_features=X_block.shape[1])
-            self._fit_torch(
-                X=X_block,
-                y=y_block,
-                returns=r_block,
-                start_index=int(start_index),
-                init_var=init_var_fit,
-                beta_ref=beta_ref_np,
-            )
-        elif self.config.backend == "jax":
-            self._ensure_jax_params(n_features=X_block.shape[1])
-            self._fit_jax(
-                X=X_block,
-                y=y_block,
-                returns=r_block,
-                start_index=int(start_index),
-                init_var=init_var_fit,
-                beta_ref=beta_ref_np,
-            )
-        else:
-            raise ValueError(f"Unsupported backend={self.config.backend!r}")
+        self._ensure_torch_module(n_features=X_block.shape[1])
+        self._fit_torch(
+            X=X_block,
+            y=y_block,
+            returns=r_block,
+            start_index=int(start_index),
+            init_var=init_var_fit,
+            beta_ref=beta_ref_np,
+        )
 
-        sigma2_next, _, _ = self.predict_with_gates(X_block, returns=r_block, init_var=init_var_fit)
+        sigma2_next, _, _ = self.predict_with_gates(
+            X_block, returns=r_block, init_var=init_var_fit
+        )
         self.init_var_ = init_var_fit
         self.last_var_ = float(sigma2_next[-1]) if len(sigma2_next) else init_var_fit
         self.last_state_ = None
@@ -327,15 +255,18 @@ class VolGRUModel(BaseVolatilityModel):
     # Cross-validation
     # -----------------------------------------------------------------
 
-    _CV_TUNABLE_FIELDS = frozenset({
-        "lr",
-        "weight_decay_gate",
-        "weight_decay_candidate",
-        "beta_stay_close_lambda",
-        "gate_entropy_lambda",
-        "max_epochs",
-        "early_stopping_patience",
-    })
+    _CV_TUNABLE_FIELDS = frozenset(
+        {
+            "lr",
+            "weight_decay_gate",
+            "weight_decay_candidate",
+            "beta_stay_close_lambda",
+            "gate_entropy_lambda",
+            "gate_feature_group_lambda",
+            "max_epochs",
+            "early_stopping_patience",
+        }
+    )
 
     def run_cv(
         self,
@@ -395,7 +326,9 @@ class VolGRUModel(BaseVolatilityModel):
                     if key in self._CV_TUNABLE_FIELDS:
                         setattr(fold_cfg, key, val)
 
-                fold_model = VolGRUModel(config=fold_cfg, random_state=self.random_state)
+                fold_model = VolGRUModel(
+                    config=fold_cfg, random_state=self.random_state
+                )
 
                 # Fit on the training fold
                 si = min(int(start_index), max(len(X_tr) - 1, 0))
@@ -418,8 +351,14 @@ class VolGRUModel(BaseVolatilityModel):
                 v0_val = float(np.mean(r_tr[-tail:] ** 2)) if tail > 0 else 1e-8
                 sigma2_va = fold_model.predict(X_va, returns=r_va, init_var=v0_val)
 
-                mse = float(np.mean((y_va - sigma2_va) ** 2))
-                fold_scores.append(mse)
+                if self.config.loss_mode == "qlike":
+                    y_safe = np.clip(y_va, self.config.eps, None)
+                    pred_safe = np.clip(sigma2_va, self.config.eps, None)
+                    ratio = y_safe / pred_safe
+                    fold_score = float(np.mean(ratio - np.log(ratio) - 1.0))
+                else:
+                    fold_score = float(np.mean((y_va - sigma2_va) ** 2))
+                fold_scores.append(fold_score)
 
             avg_score = float(np.mean(fold_scores))
             avg_epochs = int(np.round(np.mean(fold_epochs)))
@@ -443,18 +382,21 @@ class VolGRUModel(BaseVolatilityModel):
         assert self.torch_module_ is not None
         self.torch_module_.train()
 
-        X_t = torch.as_tensor(X, dtype=torch.float64)
-        y_t = torch.as_tensor(y, dtype=torch.float64)
-        r_t = torch.as_tensor(returns, dtype=torch.float64)
-        init_var_t = torch.tensor(float(init_var), dtype=torch.float64)
-        r_next_t = torch.as_tensor(align_returns_next(returns), dtype=torch.float64)
+        X_t = torch.as_tensor(X, dtype=torch.float32)
+        y_t = torch.as_tensor(y, dtype=torch.float32)
+        r_t = torch.as_tensor(returns, dtype=torch.float32)
+        init_var_t = torch.tensor(float(init_var), dtype=torch.float32)
+        r_next_t = torch.as_tensor(align_returns_next(returns), dtype=torch.float32)
 
         gate_params = list(self.torch_module_.gate_parameters())
         cand_params = list(self.torch_module_.candidate_parameters())
         param_groups: list[dict[str, Any]] = []
         if gate_params:
             param_groups.append(
-                {"params": gate_params, "weight_decay": float(self.config.weight_decay_gate)}
+                {
+                    "params": gate_params,
+                    "weight_decay": float(self.config.weight_decay_gate),
+                }
             )
         if cand_params:
             param_groups.append(
@@ -468,9 +410,7 @@ class VolGRUModel(BaseVolatilityModel):
 
         optimizer = torch.optim.AdamW(param_groups, lr=float(self.config.lr))
         beta_ref_t = (
-            None
-            if beta_ref is None
-            else torch.as_tensor(beta_ref, dtype=torch.float64)
+            None if beta_ref is None else torch.as_tensor(beta_ref, dtype=torch.float32)
         )
 
         best_loss = float("inf")
@@ -511,6 +451,12 @@ class VolGRUModel(BaseVolatilityModel):
                     sigma2_next=pred,
                     eps=self.config.eps,
                 )
+            elif self.config.loss_mode == "qlike":
+                loss = qlike_torch(
+                    y_true=target,
+                    y_pred=pred,
+                    eps=self.config.eps,
+                )
             else:
                 raise ValueError(f"Unsupported loss_mode={self.config.loss_mode!r}")
 
@@ -529,6 +475,11 @@ class VolGRUModel(BaseVolatilityModel):
                     eps=self.config.eps,
                 )
                 loss = loss + float(self.config.gate_entropy_lambda) * entropy_term
+            if self.config.gate_feature_group_lambda > 0.0:
+                beta_now_grp = self.torch_module_.get_gate_beta()
+                loss = loss + float(
+                    self.config.gate_feature_group_lambda
+                ) * feature_group_penalty_torch(beta_now_grp, eps=self.config.eps)
 
             loss.backward()
             optimizer.step()
@@ -542,12 +493,22 @@ class VolGRUModel(BaseVolatilityModel):
                     val_pred = sigma2_next[val_slice]
                     val_target = y_t[val_slice]
                     if self.config.loss_mode == "mse_r2":
-                        es_metric = float(torch.mean((val_target - val_pred) ** 2).item())
-                    else:
+                        es_metric = float(
+                            torch.mean((val_target - val_pred) ** 2).item()
+                        )
+                    elif self.config.loss_mode == "nll_gaussian":
                         es_metric = float(
                             nll_gaussian_torch(
                                 returns_next=r_next_t[val_slice],
                                 sigma2_next=val_pred,
+                                eps=self.config.eps,
+                            ).item()
+                        )
+                    else:
+                        es_metric = float(
+                            qlike_torch(
+                                y_true=val_target,
+                                y_pred=val_pred,
                                 eps=self.config.eps,
                             ).item()
                         )
@@ -568,147 +529,14 @@ class VolGRUModel(BaseVolatilityModel):
         self.training_loss_history_ = history
         self.validation_loss_history_ = val_history if use_val else None
 
-    def _fit_jax(
-        self,
-        *,
-        X: np.ndarray,
-        y: np.ndarray,
-        returns: np.ndarray,
-        start_index: int,
-        init_var: float,
-        beta_ref: np.ndarray | None,
-    ) -> None:
-        try:
-            import jax
-            import jax.numpy as jnp
-        except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
-            raise ImportError("jax is required for backend='jax'.") from exc
-
-        from .volgru_jax import volgru_forward_sequence
-
-        assert self.params_ is not None
-        params = self.params_
-        X_jnp = jnp.asarray(X, dtype=jnp.float64)
-        y_jnp = jnp.asarray(y, dtype=jnp.float64)
-        r_jnp = jnp.asarray(returns, dtype=jnp.float64)
-        r_next_jnp = jnp.asarray(align_returns_next(returns), dtype=jnp.float64)
-        beta_ref_jnp = None if beta_ref is None else jnp.asarray(beta_ref, dtype=jnp.float64)
-
-        # ----- validation split for early stopping -----
-        n_total = len(y) - int(start_index)
-        vf = float(self.config.val_fraction)
-        if vf > 0.0 and n_total > 1:
-            n_val = max(1, int(n_total * vf))
-            val_split = len(y) - n_val
-            train_slice = slice(int(start_index), val_split)
-            val_slice = slice(val_split, len(y))
-            use_val = True
-        else:
-            train_slice = slice(int(start_index), int(len(y)))
-            val_slice = None
-            use_val = False
-
-        def loss_fn(params_tree: Any) -> Any:
-            sigma2_next, z_t, _v_cand, _final_var = volgru_forward_sequence(
-                params=params_tree,
-                config=self.config,
-                X=X_jnp,
-                returns=r_jnp,
-                init_var=init_var,
-            )
-            pred = sigma2_next[train_slice]
-            target = y_jnp[train_slice]
-            if self.config.loss_mode == "mse_r2":
-                loss_val = jnp.mean((target - pred) ** 2)
-            elif self.config.loss_mode == "nll_gaussian":
-                loss_val = nll_gaussian_jax(
-                    returns_next=r_next_jnp[train_slice],
-                    sigma2_next=pred,
-                    eps=self.config.eps,
-                )
-            else:
-                raise ValueError(f"Unsupported loss_mode={self.config.loss_mode!r}")
-
-            if beta_ref_jnp is not None and self.config.beta_stay_close_lambda > 0.0:
-                beta_now = params_tree["gate"]["beta"]
-                if beta_ref_jnp.ndim == 1 and beta_now.ndim == 2:
-                    beta_ref_use = jnp.repeat(beta_ref_jnp[:, None], beta_now.shape[1], axis=1)
-                else:
-                    beta_ref_use = beta_ref_jnp
-                loss_val = loss_val + float(self.config.beta_stay_close_lambda) * jnp.sum(
-                    (beta_now - beta_ref_use) ** 2
-                )
-            if self.config.gate_entropy_lambda != 0.0:
-                loss_val = loss_val + float(self.config.gate_entropy_lambda) * gate_entropy_term_jax(
-                    z_t[train_slice],
-                    eps=self.config.eps,
-                )
-            return loss_val
-
-        def val_loss_fn(params_tree: Any) -> float:
-            sigma2_next, _z_t, _v_cand, _final_var = volgru_forward_sequence(
-                params=params_tree,
-                config=self.config,
-                X=X_jnp,
-                returns=r_jnp,
-                init_var=init_var,
-            )
-            pred = sigma2_next[val_slice]
-            target = y_jnp[val_slice]
-            if self.config.loss_mode == "mse_r2":
-                return float(jnp.mean((target - pred) ** 2))
-            return float(
-                nll_gaussian_jax(
-                    returns_next=r_next_jnp[val_slice],
-                    sigma2_next=pred,
-                    eps=self.config.eps,
-                )
-            )
-
-        value_and_grad = jax.value_and_grad(loss_fn)
-        opt_state = jax_adam_init(params)
-        best_loss = float("inf")
-        best_params = params
-        no_improve = 0
-        history: list[float] = []
-        val_history: list[float] = []
-
-        for _epoch in range(int(self.config.max_epochs)):
-            loss_val, grads = value_and_grad(params)
-            params, opt_state = jax_adam_update(
-                params=params,
-                grads=grads,
-                state=opt_state,
-                lr=float(self.config.lr),
-            )
-            loss_float = float(loss_val)
-            history.append(loss_float)
-
-            if use_val:
-                es_metric = val_loss_fn(params)
-                val_history.append(es_metric)
-            else:
-                es_metric = loss_float
-
-            if es_metric < best_loss - 1e-12:
-                best_loss = es_metric
-                best_params = params
-                no_improve = 0
-            else:
-                no_improve += 1
-            if no_improve >= int(self.config.early_stopping_patience):
-                break
-
-        self.params_ = best_params
-        self.training_loss_history_ = history
-        self.validation_loss_history_ = val_history if use_val else None
-
     def predict(self, X: Any, **kwargs: Any) -> np.ndarray:
         """Predict next-step variance sequence."""
         sigma2_next, _, _ = self.predict_with_gates(X, **kwargs)
         return sigma2_next
 
-    def predict_with_gates(self, X: Any, **kwargs: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def predict_with_gates(
+        self, X: Any, **kwargs: Any
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Predict variance and return update gates and candidate variances."""
         returns = kwargs.pop("returns", None)
         init_var = kwargs.pop("init_var", None)
@@ -720,7 +548,9 @@ class VolGRUModel(BaseVolatilityModel):
         if X_np.ndim != 2:
             raise ValueError(f"X must be 2D. Got shape {X_np.shape}.")
         if len(X_np) != len(r_np):
-            raise ValueError(f"Length mismatch: len(X)={len(X_np)} vs len(returns)={len(r_np)}")
+            raise ValueError(
+                f"Length mismatch: len(X)={len(X_np)} vs len(returns)={len(r_np)}"
+            )
 
         _check_schema(self, cols, X_np)
         backend_n_features = self._backend_feature_count()
@@ -731,28 +561,21 @@ class VolGRUModel(BaseVolatilityModel):
 
         init_var_pred = float(r_np[0] ** 2) if init_var is None else float(init_var)
 
-        if self.config.backend == "torch":
-            if self.torch_module_ is None:
-                raise ValueError("Model not initialized. Call fit() or set_gate_beta() first.")
-            sigma2_next, z_t, v_cand_t, final_var = self._predict_torch(
-                X=X_np,
-                returns=r_np,
-                init_var=init_var_pred,
+        if self.torch_module_ is None:
+            raise ValueError(
+                "Model not initialized. Call fit() or set_gate_beta() first."
             )
-        elif self.config.backend == "jax":
-            if self.params_ is None:
-                raise ValueError("Model not initialized. Call fit() or set_gate_beta() first.")
-            sigma2_next, z_t, v_cand_t, final_var = self._predict_jax(
-                X=X_np,
-                returns=r_np,
-                init_var=init_var_pred,
-            )
-        else:
-            raise ValueError(f"Unsupported backend={self.config.backend!r}")
+        sigma2_next, z_t, v_cand_t, final_var = self._predict_torch(
+            X=X_np,
+            returns=r_np,
+            init_var=init_var_pred,
+        )
 
         final_state = np.asarray(final_var, dtype=float)
         self.last_state_ = final_state.copy()
-        self.last_var_ = float(np.mean(final_state)) if final_state.size else float(init_var_pred)
+        self.last_var_ = (
+            float(np.mean(final_state)) if final_state.size else float(init_var_pred)
+        )
         if self.init_var_ is None:
             self.init_var_ = float(init_var_pred)
         return sigma2_next, z_t, v_cand_t
@@ -768,9 +591,9 @@ class VolGRUModel(BaseVolatilityModel):
 
         assert self.torch_module_ is not None
         self.torch_module_.eval()
-        X_t = torch.as_tensor(X, dtype=torch.float64)
-        r_t = torch.as_tensor(returns, dtype=torch.float64)
-        init_var_t = torch.tensor(float(init_var), dtype=torch.float64)
+        X_t = torch.as_tensor(X, dtype=torch.float32)
+        r_t = torch.as_tensor(returns, dtype=torch.float32)
+        init_var_t = torch.tensor(float(init_var), dtype=torch.float32)
         with torch.no_grad():
             sigma2_next, z_t, v_cand_t, final_var = self.torch_module_.forward_sequence(
                 X=X_t,
@@ -782,30 +605,6 @@ class VolGRUModel(BaseVolatilityModel):
             z_t.detach().cpu().numpy(),
             v_cand_t.detach().cpu().numpy(),
             final_var.detach().cpu().numpy(),
-        )
-
-    def _predict_jax(
-        self,
-        *,
-        X: np.ndarray,
-        returns: np.ndarray,
-        init_var: float,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        from .volgru_jax import volgru_forward_sequence
-
-        assert self.params_ is not None
-        sigma2_next, z_t, v_cand_t, final_var = volgru_forward_sequence(
-            params=self.params_,
-            config=self.config,
-            X=X,
-            returns=returns,
-            init_var=init_var,
-        )
-        return (
-            np.asarray(sigma2_next, dtype=float),
-            np.asarray(z_t, dtype=float),
-            np.asarray(v_cand_t, dtype=float),
-            np.asarray(final_var, dtype=float),
         )
 
     def save(self, filename: str, *, format: str = "joblib") -> None:

@@ -24,12 +24,18 @@ def _coerce_X(X: Any) -> tuple[np.ndarray, list[str] | None]:
 def _set_schema(model: Any, feature_names: list[str] | None, n_features: int) -> None:
     """Store schema metadata on a fitted model."""
     model.n_features_ = int(n_features)
-    names = feature_names if feature_names is not None else [f"x{i}" for i in range(n_features)]
+    names = (
+        feature_names
+        if feature_names is not None
+        else [f"x{i}" for i in range(n_features)]
+    )
     model.feature_names_ = list(names)
     model.feature_schema_hash_ = _schema_hash(model.feature_names_)
 
 
-def _check_schema(model: Any, X_feature_names: list[str] | None, X_np: np.ndarray) -> None:
+def _check_schema(
+    model: Any, X_feature_names: list[str] | None, X_np: np.ndarray
+) -> None:
     """Check inference-time feature schema against training schema."""
     if getattr(model, "n_features_", None) is None:
         return
@@ -39,7 +45,10 @@ def _check_schema(model: Any, X_feature_names: list[str] | None, X_np: np.ndarra
         raise ValueError(
             f"Feature count mismatch: trained {model.n_features_}, got {X_np.shape[1]}"
         )
-    if X_feature_names is not None and getattr(model, "feature_names_", None) is not None:
+    if (
+        X_feature_names is not None
+        and getattr(model, "feature_names_", None) is not None
+    ):
         if list(X_feature_names) != list(model.feature_names_):
             raise ValueError(
                 "Feature schema mismatch.\n"
@@ -85,20 +94,6 @@ def positive_transform_torch(x: Any, mode: str) -> Any:
     raise ValueError(f"Unsupported positive_transform={mode!r}")
 
 
-def positive_transform_jax(x: Any, mode: str) -> Any:
-    """Apply positivity transform in JAX."""
-    try:
-        import jax.numpy as jnp
-    except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
-        raise ImportError("jax is required for jax backend transforms.") from exc
-
-    if mode == "softplus":
-        return jnp.log1p(jnp.exp(-jnp.abs(x))) + jnp.maximum(x, 0.0)
-    if mode == "exp":
-        return jnp.exp(x)
-    raise ValueError(f"Unsupported positive_transform={mode!r}")
-
-
 def nll_gaussian_torch(returns_next: Any, sigma2_next: Any, eps: float = 1e-12) -> Any:
     """Mean Gaussian negative log-likelihood under zero mean."""
     try:
@@ -110,85 +105,36 @@ def nll_gaussian_torch(returns_next: Any, sigma2_next: Any, eps: float = 1e-12) 
     return 0.5 * torch.mean(torch.log(var) + (returns_next**2) / var)
 
 
-def nll_gaussian_jax(returns_next: Any, sigma2_next: Any, eps: float = 1e-12) -> Any:
-    """Mean Gaussian negative log-likelihood under zero mean."""
-    try:
-        import jax.numpy as jnp
-    except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
-        raise ImportError("jax is required for jax backend losses.") from exc
-
-    var = jnp.maximum(sigma2_next, float(eps))
-    return 0.5 * jnp.mean(jnp.log(var) + (returns_next**2) / var)
-
-
 def gate_entropy_term_torch(z: Any, eps: float = 1e-12) -> Any:
     """Mean z*log(z) + (1-z)*log(1-z), clamped for numerical safety."""
     zc = z.clamp(min=float(eps), max=1.0 - float(eps))
     return (zc * zc.log() + (1.0 - zc) * (1.0 - zc).log()).mean()
 
 
-def gate_entropy_term_jax(z: Any, eps: float = 1e-12) -> Any:
-    """Mean z*log(z) + (1-z)*log(1-z), clamped for numerical safety."""
+def qlike_torch(y_true: Any, y_pred: Any, eps: float = 1e-12) -> Any:
+    """Mean QLIKE loss: mean(y/pred - log(y/pred) - 1), always >= 0."""
     try:
-        import jax.numpy as jnp
+        import torch
     except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
-        raise ImportError("jax is required for jax backend regularizers.") from exc
+        raise ImportError("torch is required for torch backend losses.") from exc
 
-    zc = jnp.clip(z, float(eps), 1.0 - float(eps))
-    return jnp.mean(zc * jnp.log(zc) + (1.0 - zc) * jnp.log(1.0 - zc))
-
-
-def jax_adam_init(params: Any) -> dict[str, Any]:
-    """Initialize a tiny Adam state in JAX."""
-    try:
-        import jax
-        import jax.numpy as jnp
-    except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
-        raise ImportError("jax is required for jax optimizer utilities.") from exc
-
-    zeros = jax.tree_util.tree_map(jnp.zeros_like, params)
-    return {"m": zeros, "v": zeros, "t": jnp.array(0, dtype=jnp.int32)}
+    y_safe = torch.clamp(y_true, min=float(eps))
+    pred_safe = torch.clamp(y_pred, min=float(eps))
+    ratio = y_safe / pred_safe
+    return torch.mean(ratio - torch.log(ratio) - 1.0)
 
 
-def jax_adam_update(
-    params: Any,
-    grads: Any,
-    state: dict[str, Any],
-    lr: float,
-    *,
-    beta1: float = 0.9,
-    beta2: float = 0.999,
-    eps: float = 1e-8,
-) -> tuple[Any, dict[str, Any]]:
-    """Single Adam update step in JAX."""
-    try:
-        import jax
-        import jax.numpy as jnp
-    except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
-        raise ImportError("jax is required for jax optimizer utilities.") from exc
+def feature_group_penalty_torch(beta: Any, eps: float = 1e-12) -> Any:
+    """Row-wise group-lasso penalty: sum of L2 norms of each feature row.
 
-    t = state["t"] + 1
-    m = jax.tree_util.tree_map(
-        lambda m_prev, g: beta1 * m_prev + (1.0 - beta1) * g,
-        state["m"],
-        grads,
-    )
-    v = jax.tree_util.tree_map(
-        lambda v_prev, g: beta2 * v_prev + (1.0 - beta2) * (g * g),
-        state["v"],
-        grads,
-    )
+    For ``beta`` of shape ``(p, d)``, computes
+    ``sum_i sqrt(sum_j beta[i,j]**2 + eps)``.
+    The ``eps`` inside the sqrt ensures differentiability at the origin
+    (important because ``gate_beta`` is initialised to zeros).
+    For ``d == 1`` this reduces to an L1-like penalty on scalar gate weights.
+    """
+    import torch
 
-    t_float = t.astype(jnp.float64)
-    bias_c1 = 1.0 - beta1**t_float
-    bias_c2 = 1.0 - beta2**t_float
-
-    m_hat = jax.tree_util.tree_map(lambda x: x / bias_c1, m)
-    v_hat = jax.tree_util.tree_map(lambda x: x / bias_c2, v)
-    params_new = jax.tree_util.tree_map(
-        lambda p, mh, vh: p - lr * mh / (jnp.sqrt(vh) + eps),
-        params,
-        m_hat,
-        v_hat,
-    )
-    return params_new, {"m": m, "v": v, "t": t}
+    if beta.ndim == 1:
+        return torch.sum(torch.sqrt(beta**2 + float(eps)))
+    return torch.sum(torch.sqrt(torch.sum(beta**2, dim=1) + float(eps)))

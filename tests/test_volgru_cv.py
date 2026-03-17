@@ -221,3 +221,46 @@ def test_val_fraction_config_validation():
         VolGRUConfig(val_fraction=1.0)
     with pytest.raises(ValueError, match="val_fraction"):
         VolGRUConfig(val_fraction=-0.1)
+
+
+@pytest.mark.skipif(not HAS_TORCH, reason="torch not installed")
+def test_perform_cv_multidim():
+    """fit(perform_cv=True) works with state_dim=3 under QLIKE."""
+    torch.manual_seed(5)
+    X, y, returns = _make_synthetic()
+
+    cfg = VolGRUConfig(
+        backend="torch",
+        gate_mode="gru_linear",
+        candidate_mode="linear_pos",
+        state_dim=3,
+        loss_mode="qlike",
+        lr=1e-2,
+        max_epochs=8,
+        early_stopping_patience=8,
+    )
+    model = VolGRUModel(config=cfg, random_state=5)
+
+    grid = [
+        {"lr": 1e-2, "weight_decay_gate": 0.0, "weight_decay_candidate": 0.0},
+        {"lr": 5e-3, "weight_decay_gate": 1e-4, "weight_decay_candidate": 1e-4},
+    ]
+
+    model.fit(
+        X,
+        y,
+        returns=returns,
+        perform_cv=True,
+        cv_grid=grid,
+        cv_splits=2,
+    )
+
+    assert model.is_fitted_
+    assert model.init_var_ is not None
+
+    preds, gates, cands = model.predict_with_gates(X, returns=returns)
+    assert np.isfinite(preds).all()
+    assert preds.shape == (len(X),)
+    assert gates.shape == (len(X), 3)
+    assert cands.shape == (len(X), 3)
+    assert model.config.lr in (1e-2, 5e-3)

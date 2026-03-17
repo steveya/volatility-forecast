@@ -12,12 +12,12 @@ This module contains a single model class, :class:`XGBoostSTESModel`, that combi
 
 Two fitting routes are supported:
 
-1) ``fit_method='alternating'``
+1) ``fit_method='alternating'``  *(deprecated – will be removed)*
    Alternating supervision on a per-step pseudo-optimal gate α*_t, where α*_t is
    defined as the minimiser (over α∈[0,1]) of the one-step forecast loss while
    holding v_t fixed.
 
-2) ``fit_method='end_to_end'``
+2) ``fit_method='end_to_end'``  *(default)*
    End-to-end optimisation of the variance forecast loss through the recursion,
    using an adjoint pass to produce gradients and a stable diagonal Gauss–Newton
    approximation for Hessians.
@@ -36,6 +36,7 @@ being forecast at time t (commonly: y_t = r_{t+1}^2).
 
 from dataclasses import dataclass
 import logging
+import warnings
 from typing import Any, Dict, Iterable, Literal, Optional, Sequence, Tuple, List
 
 import numpy as np
@@ -92,7 +93,7 @@ class XGBoostSTESModel(BaseVolatilityModel):
         num_boost_round: int = 200,
         init_window: int = 500,
         # fitting mode
-        fit_method: FitMethod = "alternating",
+        fit_method: FitMethod = "end_to_end",
         # shared loss (used for α* (alternating) and end-to-end objective)
         loss: LossName = "mse",
         huber_delta: float = 1.0,
@@ -120,6 +121,13 @@ class XGBoostSTESModel(BaseVolatilityModel):
 
         if fit_method not in {"alternating", "end_to_end"}:
             raise ValueError("fit_method must be one of: {'alternating','end_to_end'}")
+        if fit_method == "alternating":
+            warnings.warn(
+                "fit_method='alternating' is deprecated and will be removed in a "
+                "future release. Use fit_method='end_to_end' instead.",
+                FutureWarning,
+                stacklevel=2,
+            )
         if loss not in {"mse", "pseudohuber", "qlike"}:
             raise ValueError("loss must be one of: {'mse','pseudohuber','qlike'}")
         if not (np.isfinite(huber_delta) and huber_delta > 0.0):

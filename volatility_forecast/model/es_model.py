@@ -9,9 +9,25 @@ class ESModel(STESModel):
     alpha (smoothing parameter) in probability space (0,1) via the alpha_ attribute.
     """
 
-    def __init__(self, params=None, *, keep_result=False, random_state=None):
+    def __init__(
+        self,
+        params=None,
+        *,
+        loss="mse",
+        l2_reg=0.0,
+        adaptive_weights=None,
+        qlike_epsilon=1e-8,
+        keep_result=False,
+        random_state=None,
+    ):
         super().__init__(
-            params=params, keep_result=keep_result, random_state=random_state
+            params=params,
+            loss=loss,
+            l2_reg=l2_reg,
+            adaptive_weights=adaptive_weights,
+            qlike_epsilon=qlike_epsilon,
+            keep_result=keep_result,
+            random_state=random_state,
         )
         self.theta_ = None  # unconstrained parameter (internal)
         self.alpha_ = None  # probability-space alpha in (0,1) (user-facing)

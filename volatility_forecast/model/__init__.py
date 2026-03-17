@@ -1,4 +1,7 @@
 from .stes_model import STESModel
+from .pgarch_linear_model import PGARCHLinearModel
+from .xgb_pgarch_full_model import XGBPGARCHModel
+from .xgb_pgarch_model import XGBGPGARCHModel
 from .tree_stes_model import XGBoostSTESModel
 from .volgru_model import VolGRUModel
 

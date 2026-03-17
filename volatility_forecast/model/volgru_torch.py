@@ -19,7 +19,7 @@ class VolGRUCellTorch(nn.Module):
         config: VolGRUConfig,
         n_features: int,
         *,
-        dtype: torch.dtype = torch.float64,
+        dtype: torch.dtype = torch.float32,
     ) -> None:
         super().__init__()
 
@@ -205,7 +205,7 @@ class VolGRUModelTorch(nn.Module):
         config: VolGRUConfig,
         n_features: int,
         *,
-        dtype: torch.dtype = torch.float64,
+        dtype: torch.dtype = torch.float32,
     ) -> None:
         super().__init__()
         self.config = config

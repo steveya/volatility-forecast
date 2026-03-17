@@ -130,6 +130,7 @@ class STESModel(BaseVolatilityModel):
         *,
         loss: LossName = "mse",
         l2_reg: float = 0.0,
+        gate_entropy_lambda: float = 0.0,
         adaptive_weights=None,
         qlike_epsilon: float = 1e-8,
         keep_result: bool = False,
@@ -145,6 +146,7 @@ class STESModel(BaseVolatilityModel):
         self.keep_result = keep_result
         self.random_state = random_state
         self.l2_reg = float(l2_reg)
+        self.gate_entropy_lambda = float(gate_entropy_lambda)
         self.qlike_epsilon = float(qlike_epsilon)
         self.adaptive_weights = (
             np.asarray(adaptive_weights, dtype=float)
@@ -307,6 +309,7 @@ class STESModel(BaseVolatilityModel):
         *,
         loss: LossName,
         qlike_epsilon: float,
+        gate_entropy_lambda: float = 0.0,
     ):
         """Compute a scalar objective and analytical gradient.
 
@@ -316,6 +319,10 @@ class STESModel(BaseVolatilityModel):
         n, p = features.shape
         alphas = expit(features @ params)
         returns2 = returns**2
+
+        # Pre-compute logits (used for entropy gradient) — logit(alpha_t) = features[t] @ params exactly.
+        logits_all = features @ params if gate_entropy_lambda != 0.0 else None
+        T_window = os_index - burnin_size
 
         v = float(returns2[0])
         d_v = np.zeros(p, dtype=float)
@@ -342,6 +349,17 @@ class STESModel(BaseVolatilityModel):
                     dloss_dvhat = (vhat_safe - y_safe) / (vhat_safe * vhat_safe)
 
                 grad += dloss_dvhat * d_vhat
+
+                # Gate entropy term: loss += lambda * mean_t [a*log(a) + (1-a)*log(1-a)]
+                # This equals -lambda * mean_t H(a_t), penalising saturated gates.
+                # Gradient w.r.t. beta: lambda/T * logit(a_t) * a_t*(1-a_t) * X_t
+                if gate_entropy_lambda != 0.0:
+                    a_c = max(1e-12, min(1.0 - 1e-12, a))
+                    objective += gate_entropy_lambda / T_window * (
+                        a_c * np.log(a_c) + (1.0 - a_c) * np.log(1.0 - a_c)
+                    )
+                    logit_t = float(logits_all[t])  # type: ignore[index]
+                    grad += (gate_entropy_lambda / T_window * logit_t * a_c * (1.0 - a_c)) * features[t]
 
             v = vhat
             d_v = d_vhat
@@ -460,6 +478,7 @@ class STESModel(BaseVolatilityModel):
         end_index: int,
         penalty_vec: np.ndarray | None,
         initial_params: np.ndarray | None = None,
+        gate_entropy_lambda: float = 0.0,
     ):
         """Optimize STES parameters under the configured loss."""
         if initial_params is None:
@@ -476,12 +495,15 @@ class STESModel(BaseVolatilityModel):
                 args=common_args,
             )
 
+        _gate_entropy_lambda = gate_entropy_lambda
+
         def obj_and_grad(beta, *args):
             return self._scalar_objective_and_grad(
                 beta,
                 *args,
                 loss=self.loss,
                 qlike_epsilon=self.qlike_epsilon,
+                gate_entropy_lambda=_gate_entropy_lambda,
             )
 
         return minimize(
@@ -593,9 +615,11 @@ class STESModel(BaseVolatilityModel):
             logger.info(f"STES Auto-tuning complete. Best Score: {best_score:.6f}")
             logger.info(f"Best Params: {best_params}")
 
-            # Update self.l2_reg with the winner
+            # Update self.l2_reg and self.gate_entropy_lambda with the winner
             if "l2_reg" in best_params:
                 self.l2_reg = float(best_params["l2_reg"])
+            if "gate_entropy_lambda" in best_params:
+                self.gate_entropy_lambda = float(best_params["gate_entropy_lambda"])
 
             # If adaptive LASSO won, compute weights on the full training set
             if "adaptive_gamma" in best_params:
@@ -643,6 +667,7 @@ class STESModel(BaseVolatilityModel):
             end_index=end_index,
             penalty_vec=penalty_vec,
             initial_params=initial_params,
+            gate_entropy_lambda=self.gate_entropy_lambda,
         )
 
         self.params = result.x
@@ -788,6 +813,7 @@ class STESModel(BaseVolatilityModel):
         for params_cand in param_grid:
             l2 = float(params_cand.get("l2_reg", 0.0))
             adaptive_gamma = params_cand.get("adaptive_gamma", None)
+            cand_gate_entropy_lambda = float(params_cand.get("gate_entropy_lambda", 0.0))
             fold_scores = []
 
             for train_idx, valid_idx in tscv.split(X_np):
@@ -841,6 +867,7 @@ class STESModel(BaseVolatilityModel):
                     end_index=len(X_tr),
                     penalty_vec=p_vec_tr,
                     initial_params=x0,
+                    gate_entropy_lambda=cand_gate_entropy_lambda,
                 )
                 beta_hat = res.x
 

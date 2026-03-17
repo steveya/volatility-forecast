@@ -9,13 +9,6 @@ try:
 except ImportError:
     HAS_TORCH = False
 
-try:
-    import jax  # noqa: F401
-
-    HAS_JAX = True
-except ImportError:
-    HAS_JAX = False
-
 from volatility_forecast.model.stes_model import STESModel
 from volatility_forecast.model.volgru_config import VolGRUConfig
 from volatility_forecast.model.volgru_model import VolGRUModel
@@ -65,8 +58,3 @@ def _run_equivalence_check(backend: str) -> None:
 def test_volgru_torch_reduces_to_stes_exactly() -> None:
     torch.manual_seed(0)
     _run_equivalence_check("torch")
-
-
-@pytest.mark.skipif(not HAS_JAX, reason="jax not installed")
-def test_volgru_jax_reduces_to_stes_exactly() -> None:
-    _run_equivalence_check("jax")

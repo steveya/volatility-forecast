@@ -10,18 +10,19 @@ from typing import Literal, Optional
 class VolGRUConfig:
     """Configuration for backend-agnostic VolGRU models."""
 
-    backend: Literal["torch", "jax"] = "torch"
+    backend: Literal["torch"] = "torch"
     gate_mode: Literal["stes_linear", "gru_linear"] = "stes_linear"
     candidate_mode: Literal["stes_r2", "linear_pos", "mlp_pos"] = "stes_r2"
     state_dim: int = 1
     use_reset_gate: bool = False
     positive_transform: Literal["softplus", "exp"] = "softplus"
-    loss_mode: Literal["mse_r2", "nll_gaussian"] = "mse_r2"
+    loss_mode: Literal["mse_r2", "nll_gaussian", "qlike"] = "mse_r2"
 
     weight_decay_gate: float = 0.0
     weight_decay_candidate: float = 0.0
     beta_stay_close_lambda: float = 0.0
     gate_entropy_lambda: float = 0.0
+    gate_feature_group_lambda: float = 0.0
 
     lr: float = 1e-2
     max_epochs: int = 200
@@ -56,5 +57,9 @@ class VolGRUConfig:
             raise ValueError("Weight decay values must be >= 0.")
         if self.beta_stay_close_lambda < 0.0:
             raise ValueError("beta_stay_close_lambda must be >= 0.")
+        if self.gate_entropy_lambda < 0.0:
+            raise ValueError("gate_entropy_lambda must be >= 0.")
+        if self.gate_feature_group_lambda < 0.0:
+            raise ValueError("gate_feature_group_lambda must be >= 0.")
         if not (0.0 <= self.val_fraction < 1.0):
             raise ValueError("val_fraction must be in [0, 1).")

@@ -54,7 +54,7 @@ class TestXGBoostSTESModelBasics:
     def test_init_default(self):
         """Test model initialization with defaults."""
         model = XGBoostSTESModel()
-        assert model.fit_method == "alternating"
+        assert model.fit_method == "end_to_end"
         assert model.loss == "mse"
         assert model.num_boost_round == 200
         assert model.init_window == 500
