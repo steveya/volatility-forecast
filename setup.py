@@ -31,8 +31,10 @@ setup(
         "python-dotenv",
         "Flask",
         "APScheduler",
+        "alphaforge @ git+https://github.com/steveya/alphaforge",
     ],
     extras_require={
         "dev": ["pytest>=7.0"],
+        "gpu": ["torch>=2.0"],
     },
 )
