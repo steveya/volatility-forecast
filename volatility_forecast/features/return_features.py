@@ -215,7 +215,7 @@ class LagSquaredLogReturnTemplate(_PriceTemplate):
         )
 
 
-class OffsetLogReturnTemplate:
+class OffsetLogReturnTemplate(_PriceTemplate):
     version = "1.0"
     name = "offset_logret"
 

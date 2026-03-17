@@ -101,6 +101,7 @@ class VolForecastStore:
                 "CREATE INDEX IF NOT EXISTS idx_act_target ON actuals(ticker, target_utc);"
             )
 
+    @staticmethod
     def _model_meta(model_obj: Any) -> dict:
         meta = {
             "model_class": f"{model_obj.__class__.__module__}.{model_obj.__class__.__name__}"
@@ -148,7 +149,7 @@ class VolForecastStore:
 
         # ---- enrich params with model metadata automatically ----
         p = dict(params or {})
-        p.update(_model_meta(model_obj))
+        p.update(self._model_meta(model_obj))
         params_json = json.dumps(p, sort_keys=True, default=str)
 
         with self._conn() as con:

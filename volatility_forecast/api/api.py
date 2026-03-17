@@ -1,9 +1,28 @@
 # api.py
 from flask import Flask, jsonify, request
-from scheduler import Scheduler
+from volatility_forecast.api.utils.scheduler import Scheduler
 
 app = Flask(__name__)
-scheduler = Scheduler(data_manager, model_manager, forecast_generator, evaluator, report_generator)
+
+# These are initialized at startup via init_app().
+data_manager = None
+model_manager = None
+forecast_generator = None
+evaluator = None
+report_generator = None
+scheduler = None
+
+
+def init_app(dm, mm, fg, ev, rg):
+    """Wire up the module-level components before first request."""
+    global data_manager, model_manager, forecast_generator, evaluator, report_generator, scheduler
+    data_manager = dm
+    model_manager = mm
+    forecast_generator = fg
+    evaluator = ev
+    report_generator = rg
+    scheduler = Scheduler(data_manager, model_manager, forecast_generator, evaluator, report_generator)
+
 
 @app.route('/forecast/<date>', methods=['GET'])
 def get_forecast(date):
