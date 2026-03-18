@@ -1,0 +1,57 @@
+data:
+  tickers: ["SPY"]
+  history_start: "2005-01-01"
+  # Feature lag depth for return-based features
+  feature_lags: 5
+  # Target scale (1e4 = basis points squared)
+  target_scale: 1.0
+
+models:
+  ES:
+    class: "volatility_forecast.model.es_model.ESModel"
+    params:
+      loss: "mse"
+    api: "sklearn"
+
+  STES:
+    class: "volatility_forecast.model.stes_model.STESModel"
+    params:
+      loss: "mse"
+    api: "sklearn"
+
+  XGBoost-STES:
+    class: "volatility_forecast.model.tree_stes_model.XGBoostSTESModel"
+    params:
+      loss: "mse"
+      num_boost_round: 50
+      max_depth: 3
+      learning_rate: 0.1
+    api: "sklearn"
+
+  PGARCHLinear:
+    class: "volatility_forecast.model.pgarch_linear_model.PGARCHLinearModel"
+    params: {}
+    api: "pgarch"
+
+training:
+  # Burn-in period for variance recursion warm-up
+  burn_in: 100
+  # Minimum observations before first training
+  min_history_days: 500
+  # OOS start date — forecasts from this date onward are scored on the leaderboard
+  oos_start: "2024-03-01"
+  # Global refit policy (can be overridden per model)
+  refit_policy:
+    type: "every_n_days"
+    params:
+      n_days: 30
+
+store:
+  root: "./vol_store"
+
+leaderboard:
+  # Rolling window in trading days for metric computation
+  rolling_window_days: 252
+  metrics: ["qlike", "rmse", "mae", "hit_rate", "corr"]
+  # Primary ranking metric (lower is better for qlike/rmse/mae)
+  primary_metric: "qlike"
