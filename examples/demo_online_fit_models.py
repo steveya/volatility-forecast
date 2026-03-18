@@ -29,7 +29,7 @@ from volatility_forecast.model.es_model import ESModel
 from volatility_forecast.model.stes_model import STESModel
 
 try:
-    from volatility_forecast.model.xgboost_stes_model import XGBoostSTESModel
+    from volatility_forecast.model.tree_stes_model import XGBoostSTESModel
 
     _HAS_XGB = True
 except Exception:

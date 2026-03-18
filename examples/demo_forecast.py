@@ -31,7 +31,7 @@ from volatility_forecast.features.return_features import (
 from volatility_forecast.targets.squared_return import NextDaySquaredReturnTarget
 from volatility_forecast.model.es_model import ESModel
 from volatility_forecast.model.stes_model import STESModel
-from volatility_forecast.model.xgboost_stes_model import XGBoostSTESModel
+from volatility_forecast.model.tree_stes_model import XGBoostSTESModel
 from volatility_forecast.benchmark import run as bench
 from volatility_forecast.evaluation import metrics, dm_test, mz
 

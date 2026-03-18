@@ -1,7 +1,7 @@
 import os
 import requests
 import pandas as pd
-from typing import List, Any, NoReturn, Mapping, Optional
+from typing import List, Any, Mapping, Optional
 from functools import lru_cache
 from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -19,7 +19,7 @@ def get_tiingo_api():
 
 
 class TiingoEoDDataLoader(DataLoader):
-    def __init__(self, tickers: List[str]) -> NoReturn:
+    def __init__(self, tickers: List[str]) -> None:
         self.tickers = tickers
         super().__init__()
 
@@ -114,7 +114,7 @@ class TiingoEoDDataLoader(DataLoader):
 
 
 class TiingoEodDataLoaderProd(DataLoader):
-    def __init__(self, tickers: List[str]) -> NoReturn:
+    def __init__(self, tickers: List[str]) -> None:
         self.tickers = tickers
         super().__init__()
 
@@ -261,7 +261,7 @@ class TiingoEodDataLoaderProd(DataLoader):
 
 
 class PriceVolumeDatabaseLoader(DataLoader):
-    def __init__(self, tickers: List[str]) -> NoReturn:
+    def __init__(self, tickers: List[str]) -> None:
         self.tickers = tickers
         super().__init__()
 

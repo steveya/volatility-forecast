@@ -145,7 +145,7 @@ class VolForecastStore:
         artifact_path = artifact_dir / f"{model_id}.joblib"
         joblib.dump(model_obj, artifact_path)
 
-        created = pd.Timestamp.utcnow().tz_localize("UTC")
+        created = pd.Timestamp.now("UTC")
 
         # ---- enrich params with model metadata automatically ----
         p = dict(params or {})
@@ -256,7 +256,7 @@ class VolForecastStore:
     ) -> str:
         asof_utc = _ts_utc(asof_utc)
         target_utc = _ts_utc(target_utc)
-        created = pd.Timestamp.utcnow().tz_localize("UTC")
+        created = pd.Timestamp.now("UTC")
 
         # forecast_id is deterministic for idempotency
         forecast_id = f"{model_id}|{ticker}|{asof_utc.isoformat()}|{target_utc.isoformat()}|h{horizon}"
@@ -325,7 +325,7 @@ class VolForecastStore:
         meta: Optional[dict] = None,
     ) -> str:
         target_utc = _ts_utc(target_utc)
-        created = pd.Timestamp.utcnow().tz_localize("UTC")
+        created = pd.Timestamp.now("UTC")
         actual_id = f"{ticker}|{target_utc.isoformat()}|h{horizon}"
         meta_json = json.dumps(meta or {}, sort_keys=True)
 

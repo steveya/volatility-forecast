@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from typing import Type, NoReturn, List
+from typing import Type, List
 from .base import ensure_timestamp, DateLike
 from .dataset import PriceVolume
 from .dataloader import TiingoEoDDataLoader
@@ -9,7 +9,7 @@ import pandas_market_calendars as mcal
 
 
 class ReturnDataManager:
-    def __init__(self, data_loader_type: Type = TiingoEoDDataLoader) -> NoReturn:
+    def __init__(self, data_loader_type: Type = TiingoEoDDataLoader) -> None:
         self.data_loader_type = data_loader_type
 
     def get_data(
@@ -37,10 +37,10 @@ class ReturnDataManager:
         return np.diff(np.log(data), axis=0), date
 
 
-class HighLownDataManager:
+class HighLowDataManager:
     def __init__(
         self, lag: int = 1, data_loader_type: Type = TiingoEoDDataLoader
-    ) -> NoReturn:
+    ) -> None:
         self.lag = lag
         self.data_loader_type = data_loader_type
 
@@ -75,7 +75,7 @@ class HighLownDataManager:
 
 
 class OffsetReturnDataManager:
-    def __init__(self, lag, data_loader_type: Type = TiingoEoDDataLoader) -> NoReturn:
+    def __init__(self, lag, data_loader_type: Type = TiingoEoDDataLoader) -> None:
         self.lag = lag
         self.data_loader_type = data_loader_type
         super().__init__()
@@ -103,7 +103,7 @@ class OffsetReturnDataManager:
 class LagReturnDataManager:
     def __init__(
         self, lag: int = 1, data_loader_type: Type = TiingoEoDDataLoader
-    ) -> NoReturn:
+    ) -> None:
         self.lag = lag
         self.data_loader_type = data_loader_type
         super().__init__()
@@ -126,7 +126,7 @@ class LagReturnDataManager:
 class LagAbsReturnDataManager:
     def __init__(
         self, lag: int = 1, data_loader_type: Type = TiingoEoDDataLoader
-    ) -> NoReturn:
+    ) -> None:
         self.lag = lag
         self.data_loader_type = data_loader_type
         super().__init__()
@@ -150,7 +150,7 @@ class LagAbsReturnDataManager:
 class LagSquareReturnDataManager:
     def __init__(
         self, lag: int = 1, data_loader_type: Type = TiingoEoDDataLoader
-    ) -> NoReturn:
+    ) -> None:
         self.lag = lag
         self.data_loader_type = data_loader_type
         super().__init__()
@@ -172,7 +172,7 @@ class LagSquareReturnDataManager:
 
 
 class SquareReturnDataManager:
-    def __init__(self, data_loader_type: Type = TiingoEoDDataLoader) -> NoReturn:
+    def __init__(self, data_loader_type: Type = TiingoEoDDataLoader) -> None:
         self.data_loader_type = data_loader_type
 
     def get_data(

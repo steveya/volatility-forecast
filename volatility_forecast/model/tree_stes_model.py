@@ -46,8 +46,16 @@ from sklearn.model_selection import TimeSeriesSplit
 
 try:
     import xgboost as xgb
+
+    # xgboost 2.0+ renamed `feval` to `custom_metric` in xgb.train()
+    _XGB_CUSTOM_METRIC_KEY = (
+        "custom_metric"
+        if hasattr(xgb, "__version__") and tuple(int(x) for x in xgb.__version__.split(".")[:2]) >= (2, 0)
+        else "feval"
+    )
 except Exception:  # pragma: no cover
     xgb = None  # type: ignore
+    _XGB_CUSTOM_METRIC_KEY = "feval"
 
 from .base_model import BaseVolatilityModel
 
@@ -814,7 +822,7 @@ class XGBoostSTESModel(BaseVolatilityModel):
             dtrain=dtrain,
             num_boost_round=self.num_boost_round,
             obj=obj_train,
-            custom_metric=feval_valid,
+            **{_XGB_CUSTOM_METRIC_KEY: feval_valid},
             evals=[(dtrain, "train"), (dvalid, "valid")],
             early_stopping_rounds=params.get("early_stopping_rounds", 10),
             verbose_eval=False,
@@ -1111,7 +1119,7 @@ class XGBoostSTESModel(BaseVolatilityModel):
                     dtrain=dtrain,
                     num_boost_round=self.num_boost_round,
                     obj=obj_closure,
-                    custom_metric=feval_closure,
+                    **{_XGB_CUSTOM_METRIC_KEY: feval_closure},
                     evals=[(dvalid, "valid")],
                     early_stopping_rounds=p.get("early_stopping_rounds", 10),
                     verbose_eval=False,

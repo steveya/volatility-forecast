@@ -8,7 +8,7 @@ setup(
     description="A package of volatility forecasting models",
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
-    url="https://github.com/steveta/volatility-forecast",
+    url="https://github.com/steveya/volatility-forecast",
     packages=find_packages(exclude=["tests", "tests.*"]),
     classifiers=[
         "Programming Language :: Python :: 3",
@@ -21,20 +21,26 @@ setup(
         "pandas",
         "scipy",
         "scikit-learn",
-        "xgboost",
+        "xgboost>=1.5",
         "sktime",
         "duckdb",
         "joblib",
         "requests",
         "sqlalchemy",
         "pandas-market-calendars",
+        "toolz",
         "python-dotenv",
-        "Flask",
-        "APScheduler",
+        "PyYAML",
         "alphaforge @ git+https://github.com/steveya/alphaforge",
     ],
     extras_require={
         "dev": ["pytest>=7.0"],
         "gpu": ["torch>=2.0"],
+        "api": ["Flask", "APScheduler", "flasgger"],
+    },
+    entry_points={
+        "console_scripts": [
+            "volfcast=volatility_forecast.cli:main",
+        ],
     },
 )
