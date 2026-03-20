@@ -9,6 +9,7 @@ import pytest
 from datetime import datetime, timedelta
 
 pytest.importorskip("alphaforge")
+pytest.importorskip("esig")
 
 from volatility_forecast.features.signature_features import SignatureFeaturesTemplate
 from volatility_forecast.sources.simulated_garch import SimulatedGARCHSource
