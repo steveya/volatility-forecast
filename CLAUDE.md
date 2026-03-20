@@ -107,6 +107,6 @@ Features use alphaforge `FeatureTemplate` patterns. Key feature types:
 
 ## Dependencies
 
-Core: numpy, pandas, scipy, scikit-learn, joblib, requests, sqlalchemy, pandas-market-calendars, python-dotenv
+Core: numpy, pandas, scipy, scikit-learn, joblib, requests, sqlalchemy, pandas-market-calendars, python-dotenv, alphaforge, duckdb
 
 Optional: xgboost, sktime (>=0.24.0), torch, jax, flask, apscheduler, matplotlib, seaborn
