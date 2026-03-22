@@ -59,10 +59,15 @@ class XGBPGARCHModel:
         eval_metric: str | None = None,
         random_state: int | None = None,
         verbosity: int = 0,
+        channel_features: dict[str, list[int]] | None = None,
+        booster: str = "gbtree",
     ) -> None:
         valid_losses = {"mse", "rmse", "qlike"}
         valid_init_methods = {"linear_pgarch", "intercept_only_pgarch"}
         valid_eval_metrics = {None, "mse", "rmse", "qlike"}
+        valid_boosters = {"gbtree", "gblinear"}
+        if booster not in valid_boosters:
+            raise ValueError(f"booster must be one of {sorted(valid_boosters)}")
         valid_channels = ("mu", "phi", "g")
 
         if loss not in valid_losses:
@@ -124,6 +129,8 @@ class XGBPGARCHModel:
         self.eval_metric = eval_metric
         self.random_state = random_state
         self.verbosity = int(verbosity)
+        self.channel_features = channel_features
+        self.booster = booster
 
         self.booster_mu_: Any = None
         self.booster_phi_: Any = None
@@ -345,7 +352,11 @@ class XGBPGARCHModel:
                 self.init_method_ = "intercept_only_pgarch"
                 return initializer
 
-            initializer = PGARCHLinearModel(loss=self.loss, random_state=self.random_state)
+            initializer = PGARCHLinearModel(
+                loss=self.loss,
+                random_state=self.random_state,
+                channel_features=self.channel_features,
+            )
             initializer.fit(y, X)
             self.init_method_ = "linear_pgarch"
             return initializer
@@ -421,11 +432,11 @@ class XGBPGARCHModel:
         c = self._inverse_link_g(np.asarray(components["g"], dtype=float))
 
         if self.booster_mu_ is not None:
-            a = a + self._predict_margin(self.booster_mu_, X_np)
+            a = a + self._predict_margin(self.booster_mu_, X_np, channel="mu")
         if self.booster_phi_ is not None:
-            b = b + self._predict_margin(self.booster_phi_, X_np)
+            b = b + self._predict_margin(self.booster_phi_, X_np, channel="phi")
         if self.booster_g_ is not None:
-            c = c + self._predict_margin(self.booster_g_, X_np)
+            c = c + self._predict_margin(self.booster_g_, X_np, channel="g")
         return a, b, c
 
     def _link_mu(self, a: np.ndarray) -> np.ndarray:
@@ -607,10 +618,18 @@ class XGBPGARCHModel:
     ) -> tuple[np.ndarray, np.ndarray]:
         return self._rowwise_grad_hess_from_impulse(y, state, "local_impulse_g")
 
+    def _channel_col_indices(self, channel: str) -> np.ndarray | None:
+        """Return the column indices for *channel*, or ``None`` when all
+        columns are shared (no ``channel_features`` specified)."""
+        if self.channel_features is None:
+            return None
+        return np.asarray(self.channel_features[channel], dtype=int)
+
     def _make_dmatrix(
         self,
         X: np.ndarray,
         y: np.ndarray | None = None,
+        channel: str | None = None,
     ) -> xgb.DMatrix:
         self._require_xgboost()
         X_np, cols = _coerce_X(X)
@@ -620,8 +639,19 @@ class XGBPGARCHModel:
             raise ValueError(f"Expected {self.n_features_in_} features, got {X_np.shape[1]}.")
         if cols is not None and self.feature_names_ is not None and list(cols) != list(self.feature_names_):
             raise ValueError("Feature schema mismatch.")
+
+        ch_idx = self._channel_col_indices(channel) if channel is not None else None
+        if ch_idx is not None:
+            X_np = X_np[:, ch_idx]
+            feature_names = (
+                [self.feature_names_[i] for i in ch_idx]
+                if self.feature_names_ is not None
+                else ([cols[i] for i in ch_idx] if cols is not None else None)
+            )
+        else:
+            feature_names = self.feature_names_ if self.feature_names_ is not None else cols
+
         label = None if y is None else np.asarray(y, dtype=float)
-        feature_names = self.feature_names_ if self.feature_names_ is not None else cols
         return xgb.DMatrix(X_np, label=label, feature_names=feature_names)
 
     def _fit_channel_update(
@@ -651,7 +681,7 @@ class XGBPGARCHModel:
             "g": self._rowwise_grad_hess_g,
         }
 
-        dtrain = self._make_dmatrix(X, y)
+        dtrain = self._make_dmatrix(X, y, channel=channel)
         dtrain.set_base_margin(np.asarray(base_map[channel], dtype=float))
 
         def objective(preds: np.ndarray, dmatrix: xgb.DMatrix) -> tuple[np.ndarray, np.ndarray]:
@@ -694,7 +724,7 @@ class XGBPGARCHModel:
                 train_kwargs["feval"] = channel_metric
 
         booster = xgb.train(**train_kwargs)
-        updated_scores = np.asarray(base_map[channel], dtype=float) + self._predict_margin(booster, X)
+        updated_scores = np.asarray(base_map[channel], dtype=float) + self._predict_margin(booster, X, channel=channel)
         return updated_scores, booster
 
     @property
@@ -813,6 +843,7 @@ class XGBPGARCHModel:
 
     def _xgb_params(self) -> dict[str, Any]:
         params: dict[str, Any] = {
+            "booster": self.booster,
             "eta": self.learning_rate,
             "max_depth": self.max_depth,
             "min_child_weight": self.min_child_weight,
@@ -829,8 +860,8 @@ class XGBPGARCHModel:
             params["seed"] = int(self.random_state)
         return params
 
-    def _predict_margin(self, booster: Any, X: np.ndarray) -> np.ndarray:
-        dmatrix = self._make_dmatrix(X)
+    def _predict_margin(self, booster: Any, X: np.ndarray, channel: str | None = None) -> np.ndarray:
+        dmatrix = self._make_dmatrix(X, channel=channel)
         return np.asarray(booster.predict(dmatrix, output_margin=True), dtype=float)
 
     def _score_from_state(self, y: np.ndarray, h: np.ndarray, metric: str) -> float:

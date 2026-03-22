@@ -137,11 +137,15 @@ class XGBGPGARCHModel:
         eval_metric: str | None = None,
         random_state: int | None = None,
         verbosity: int = 0,
+        booster: str = "gbtree",
     ) -> None:
         valid_losses = {"mse", "rmse", "qlike"}
         valid_init_methods = {"linear_pgarch", "intercept_only_pgarch"}
+        valid_boosters = {"gbtree", "gblinear"}
         if loss not in valid_losses:
             raise ValueError(f"loss must be one of {sorted(valid_losses)}")
+        if booster not in valid_boosters:
+            raise ValueError(f"booster must be one of {sorted(valid_boosters)}")
         if init_method not in valid_init_methods:
             raise ValueError(f"init_method must be one of {sorted(valid_init_methods)}")
         if n_estimators <= 0:
@@ -186,6 +190,7 @@ class XGBGPGARCHModel:
         self.eval_metric = eval_metric
         self.random_state = random_state
         self.verbosity = int(verbosity)
+        self.booster = booster
 
         self.booster_: Any = None
         self.initializer_: object | None = None
@@ -761,6 +766,7 @@ class XGBGPGARCHModel:
 
     def _xgb_params(self) -> dict[str, Any]:
         params: dict[str, Any] = {
+            "booster": self.booster,
             "eta": self.learning_rate,
             "max_depth": self.max_depth,
             "min_child_weight": self.min_child_weight,

@@ -66,6 +66,9 @@ class PGARCHLinearModel:
         lambda_mu: float = 0.0,
         lambda_phi: float = 0.0,
         lambda_g: float = 0.0,
+        dynamic_mu: bool = True,
+        dynamic_phi: bool = True,
+        dynamic_g: bool = True,
         mu_min: float = 1e-12,
         phi_min: float = 1e-4,
         phi_max: float = 1.0 - 1e-4,
@@ -78,6 +81,7 @@ class PGARCHLinearModel:
         n_restarts: int = 1,
         standardize_features: bool = True,
         random_state: int | None = None,
+        channel_features: dict[str, list[int]] | None = None,
     ) -> None:
         valid_losses = {"mse", "rmse", "qlike"}
         if loss not in valid_losses:
@@ -108,6 +112,9 @@ class PGARCHLinearModel:
         self.lambda_mu = float(lambda_mu)
         self.lambda_phi = float(lambda_phi)
         self.lambda_g = float(lambda_g)
+        self.dynamic_mu = bool(dynamic_mu)
+        self.dynamic_phi = bool(dynamic_phi)
+        self.dynamic_g = bool(dynamic_g)
         self.mu_min = float(mu_min)
         self.phi_min = float(phi_min)
         self.phi_max = float(phi_max)
@@ -120,6 +127,15 @@ class PGARCHLinearModel:
         self.n_restarts = int(n_restarts)
         self.standardize_features = bool(standardize_features)
         self.random_state = random_state
+        self.channel_features = channel_features
+
+        # Per-channel layout (set during fit)
+        self._mu_aug_cols_: np.ndarray | None = None
+        self._phi_aug_cols_: np.ndarray | None = None
+        self._g_aug_cols_: np.ndarray | None = None
+        self._n_mu_: int | None = None
+        self._n_phi_: int | None = None
+        self._n_g_: int | None = None
 
         self.coef_mu_: np.ndarray | None = None
         self.coef_phi_: np.ndarray | None = None
@@ -147,6 +163,7 @@ class PGARCHLinearModel:
         """
         y_np, X_np = self._validate_inputs(y, X)
         self.n_features_in_ = int(X_np.shape[1])
+        self._setup_channel_layout(self.n_features_in_)
         X_std = self._standardize_fit(X_np)
         X_aug = self._add_intercept(X_std)
 
@@ -166,6 +183,7 @@ class PGARCHLinearModel:
                 args=(y_np, X_aug),
                 jac=True,
                 method="L-BFGS-B",
+                bounds=self._parameter_bounds(X_aug.shape[1]),
                 tol=self.tol,
                 options={
                     "maxiter": self.max_iter,
@@ -237,6 +255,47 @@ class PGARCHLinearModel:
         h_safe = np.maximum(h_eff, self.h_min)
         return float(np.mean(np.log(h_safe) + y_eff / h_safe))
 
+    def _setup_channel_layout(self, n_features: int) -> None:
+        """Compute per-channel X_aug column indices and parameter counts.
+
+        When ``channel_features`` is ``None`` every channel sees all columns
+        (backward-compatible).  Otherwise each channel sees only its own
+        feature columns plus the intercept (column 0 in X_aug).
+        """
+        if self.channel_features is None:
+            all_aug = np.arange(1 + n_features)
+            self._mu_aug_cols_ = all_aug
+            self._phi_aug_cols_ = all_aug
+            self._g_aug_cols_ = all_aug
+        else:
+            for ch in ("mu", "phi", "g"):
+                if ch not in self.channel_features:
+                    raise ValueError(
+                        f"channel_features must contain key '{ch}'."
+                    )
+                idx = np.asarray(self.channel_features[ch], dtype=int)
+                if idx.ndim != 1:
+                    raise ValueError(
+                        f"channel_features['{ch}'] must be a 1-D sequence of column indices."
+                    )
+                if len(idx) > 0 and (idx.min() < 0 or idx.max() >= n_features):
+                    raise ValueError(
+                        f"channel_features['{ch}'] indices must be in [0, {n_features})."
+                    )
+            self._mu_aug_cols_ = np.concatenate(
+                [[0], np.asarray(self.channel_features["mu"], dtype=int) + 1]
+            )
+            self._phi_aug_cols_ = np.concatenate(
+                [[0], np.asarray(self.channel_features["phi"], dtype=int) + 1]
+            )
+            self._g_aug_cols_ = np.concatenate(
+                [[0], np.asarray(self.channel_features["g"], dtype=int) + 1]
+            )
+
+        self._n_mu_ = len(self._mu_aug_cols_)
+        self._n_phi_ = len(self._phi_aug_cols_)
+        self._n_g_ = len(self._g_aug_cols_)
+
     def _validate_inputs(self, y: np.ndarray, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         y_np = np.asarray(y, dtype=float)
         X_np = np.asarray(X, dtype=float)
@@ -295,17 +354,26 @@ class PGARCHLinearModel:
 
     def _unpack_params(self, theta: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         theta_np = np.asarray(theta, dtype=float)
-        if theta_np.ndim != 1 or theta_np.size % 3 != 0:
-            raise ValueError("theta must be a flat vector with length divisible by 3.")
-        block = theta_np.size // 3
+        if theta_np.ndim != 1:
+            raise ValueError("theta must be a flat 1-D vector.")
+        n_mu = self._n_mu_ if self._n_mu_ is not None else theta_np.size // 3
+        n_phi = self._n_phi_ if self._n_phi_ is not None else theta_np.size // 3
+        n_g = self._n_g_ if self._n_g_ is not None else theta_np.size // 3
+        expected = n_mu + n_phi + n_g
+        if theta_np.size != expected:
+            raise ValueError(
+                f"theta has {theta_np.size} elements but channel layout expects {expected} "
+                f"(mu={n_mu}, phi={n_phi}, g={n_g})."
+            )
         return (
-            theta_np[:block].copy(),
-            theta_np[block : 2 * block].copy(),
-            theta_np[2 * block :].copy(),
+            theta_np[:n_mu].copy(),
+            theta_np[n_mu : n_mu + n_phi].copy(),
+            theta_np[n_mu + n_phi :].copy(),
         )
 
     def _initialize_params(self, y: np.ndarray, X_aug: np.ndarray) -> np.ndarray:
-        block = int(np.asarray(X_aug, dtype=float).shape[1])
+        if self._n_mu_ is None:
+            self._setup_channel_layout(X_aug.shape[1] - 1)
         v0 = max(float(np.mean(y)), self.h_min)
         mu0 = v0
         phi0 = float(np.clip(0.98, self.phi_min + 1e-8, self.phi_max - 1e-8))
@@ -315,13 +383,36 @@ class PGARCHLinearModel:
         b0 = _logit((phi0 - self.phi_min) / (self.phi_max - self.phi_min))
         c0 = _logit((g0 - self.g_min) / (self.g_max - self.g_min))
 
-        w_mu = np.zeros(block, dtype=float)
-        w_phi = np.zeros(block, dtype=float)
-        w_g = np.zeros(block, dtype=float)
+        w_mu = np.zeros(self._n_mu_, dtype=float)
+        w_phi = np.zeros(self._n_phi_, dtype=float)
+        w_g = np.zeros(self._n_g_, dtype=float)
         w_mu[0] = float(a0)
         w_phi[0] = float(b0)
         w_g[0] = float(c0)
         return self._pack_params(w_mu, w_phi, w_g)
+
+    def _channel_bounds(
+        self,
+        *,
+        dynamic: bool,
+        block: int,
+    ) -> list[tuple[float | None, float | None]]:
+        bounds: list[tuple[float | None, float | None]] = [(None, None)] * block
+        if dynamic:
+            return bounds
+        for idx in range(1, block):
+            bounds[idx] = (0.0, 0.0)
+        return bounds
+
+    def _parameter_bounds(
+        self,
+        block: int,
+    ) -> list[tuple[float | None, float | None]]:
+        return (
+            self._channel_bounds(dynamic=self.dynamic_mu, block=self._n_mu_)
+            + self._channel_bounds(dynamic=self.dynamic_phi, block=self._n_phi_)
+            + self._channel_bounds(dynamic=self.dynamic_g, block=self._n_g_)
+        )
 
     def _forward_recursion(
         self,
@@ -337,17 +428,21 @@ class PGARCHLinearModel:
         y_np = np.asarray(y, dtype=float)
         X_aug_np = np.asarray(X_aug, dtype=float)
         T = y_np.shape[0]
+        if self._n_mu_ is None:
+            self._setup_channel_layout(X_aug_np.shape[1] - 1)
         w_mu, w_phi, w_g = self._unpack_params(theta)
-        block = X_aug_np.shape[1]
-        if len(w_mu) != block or len(w_phi) != block or len(w_g) != block:
-            raise ValueError(
-                "theta block size must match X_aug.shape[1]. "
-                f"Got theta block size {len(w_mu)} and X_aug.shape[1]={block}."
-            )
-        total_params = 3 * block
-        mu_slice = slice(0, block)
-        phi_slice = slice(block, 2 * block)
-        g_slice = slice(2 * block, 3 * block)
+        n_mu = len(w_mu)
+        n_phi = len(w_phi)
+        n_g = len(w_g)
+        total_params = n_mu + n_phi + n_g
+        mu_slice = slice(0, n_mu)
+        phi_slice = slice(n_mu, n_mu + n_phi)
+        g_slice = slice(n_mu + n_phi, total_params)
+
+        mu_cols = self._mu_aug_cols_
+        phi_cols = self._phi_aug_cols_
+        g_cols = self._g_aug_cols_
+
         phi_span = self.phi_max - self.phi_min
         g_span = self.g_max - self.g_min
 
@@ -365,12 +460,14 @@ class PGARCHLinearModel:
         H = np.zeros((T, total_params, total_params), dtype=float) if compute_hess else None
 
         for t in range(1, T):
-            x = X_aug_np[t - 1]
-            outer_x = np.outer(x, x) if compute_hess else None
+            x_full = X_aug_np[t - 1]
+            x_mu = x_full[mu_cols]
+            x_phi = x_full[phi_cols]
+            x_g = x_full[g_cols]
 
-            a_t = float(np.dot(w_mu, x))
-            b_t = float(np.dot(w_phi, x))
-            c_t = float(np.dot(w_g, x))
+            a_t = float(np.dot(w_mu, x_mu))
+            b_t = float(np.dot(w_phi, x_phi))
+            c_t = float(np.dot(w_g, x_g))
 
             sig_a = float(_sigmoid(a_t))
             sig_b = float(_sigmoid(b_t))
@@ -396,9 +493,9 @@ class PGARCHLinearModel:
                 J_phi_t = np.zeros(total_params, dtype=float)
                 J_g_t = np.zeros(total_params, dtype=float)
 
-                J_mu_t[mu_slice] = sig_a * x
-                J_phi_t[phi_slice] = phi_span * sig_b * (1.0 - sig_b) * x
-                J_g_t[g_slice] = g_span * sig_c * (1.0 - sig_c) * x
+                J_mu_t[mu_slice] = sig_a * x_mu
+                J_phi_t[phi_slice] = phi_span * sig_b * (1.0 - sig_b) * x_phi
+                J_g_t[g_slice] = g_span * sig_c * (1.0 - sig_c) * x_g
 
                 J_prev = J[t - 1]
 
@@ -406,16 +503,22 @@ class PGARCHLinearModel:
                 J_q_t = (1.0 - g_t) * J_prev + (y_prev - h_prev) * J_g_t
 
                 if compute_hess:
+                    outer_x_mu = np.outer(x_mu, x_mu)
+                    outer_x_phi = np.outer(x_phi, x_phi)
+                    outer_x_g = np.outer(x_g, x_g)
+
                     H_mu_t = np.zeros((total_params, total_params), dtype=float)
                     H_phi_t = np.zeros((total_params, total_params), dtype=float)
                     H_g_t = np.zeros((total_params, total_params), dtype=float)
 
-                    H_mu_t[mu_slice, mu_slice] = sig_a * (1.0 - sig_a) * outer_x
-                    H_phi_t[phi_slice, phi_slice] = (
-                        phi_span * sig_b * (1.0 - sig_b) * (1.0 - 2.0 * sig_b) * outer_x
+                    H_mu_t[np.ix_(np.arange(n_mu), np.arange(n_mu))] = (
+                        sig_a * (1.0 - sig_a) * outer_x_mu
                     )
-                    H_g_t[g_slice, g_slice] = (
-                        g_span * sig_c * (1.0 - sig_c) * (1.0 - 2.0 * sig_c) * outer_x
+                    H_phi_t[np.ix_(np.arange(n_mu, n_mu + n_phi), np.arange(n_mu, n_mu + n_phi))] = (
+                        phi_span * sig_b * (1.0 - sig_b) * (1.0 - 2.0 * sig_b) * outer_x_phi
+                    )
+                    H_g_t[np.ix_(np.arange(n_mu + n_phi, total_params), np.arange(n_mu + n_phi, total_params))] = (
+                        g_span * sig_c * (1.0 - sig_c) * (1.0 - 2.0 * sig_c) * outer_x_g
                     )
 
                     H_prev = H[t - 1]
@@ -596,10 +699,12 @@ class PGARCHLinearModel:
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         if self.theta_ is None:
             raise ValueError("Model is not fitted.")
+        if self._n_mu_ is None:
+            self._setup_channel_layout(X_aug.shape[1] - 1)
         w_mu, w_phi, w_g = self._unpack_params(self.theta_)
-        a = X_aug @ w_mu
-        b = X_aug @ w_phi
-        c = X_aug @ w_g
+        a = X_aug[:, self._mu_aug_cols_] @ w_mu
+        b = X_aug[:, self._phi_aug_cols_] @ w_phi
+        c = X_aug[:, self._g_aug_cols_] @ w_g
         mu = self.mu_min + np.asarray(_softplus(a), dtype=float)
         phi = self.phi_min + (self.phi_max - self.phi_min) * np.asarray(
             _sigmoid(b), dtype=float
@@ -626,16 +731,17 @@ class PGARCHLinearModel:
         return self._pack_params(grad_mu, grad_phi, grad_g)
 
     def _regularization_hessian(self, theta: np.ndarray) -> np.ndarray:
-        block = np.asarray(theta, dtype=float).size // 3
-        total = 3 * block
+        w_mu, w_phi, w_g = self._unpack_params(theta)
+        n_mu, n_phi, n_g = len(w_mu), len(w_phi), len(w_g)
+        total = n_mu + n_phi + n_g
         hessian = np.zeros((total, total), dtype=float)
-        diag_mu = np.zeros(block, dtype=float)
-        diag_phi = np.zeros(block, dtype=float)
-        diag_g = np.zeros(block, dtype=float)
+        diag_mu = np.zeros(n_mu, dtype=float)
+        diag_phi = np.zeros(n_phi, dtype=float)
+        diag_g = np.zeros(n_g, dtype=float)
         diag_mu[1:] = 2.0 * self.lambda_mu
         diag_phi[1:] = 2.0 * self.lambda_phi
         diag_g[1:] = 2.0 * self.lambda_g
-        hessian[:block, :block] = np.diag(diag_mu)
-        hessian[block : 2 * block, block : 2 * block] = np.diag(diag_phi)
-        hessian[2 * block :, 2 * block :] = np.diag(diag_g)
+        hessian[:n_mu, :n_mu] = np.diag(diag_mu)
+        hessian[n_mu : n_mu + n_phi, n_mu : n_mu + n_phi] = np.diag(diag_phi)
+        hessian[n_mu + n_phi :, n_mu + n_phi :] = np.diag(diag_g)
         return hessian
