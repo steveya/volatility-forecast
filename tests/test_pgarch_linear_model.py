@@ -192,6 +192,40 @@ def test_intercept_only_like_constant_garch_structure():
         assert np.allclose(implied[key], implied[key][0], atol=1e-10, rtol=0.0)
 
 
+def test_channel_restrictions_support_constant_mu_variants():
+    y, X = make_synthetic_pgarch_data(seed=13)
+    model = PGARCHLinearModel(
+        loss="qlike",
+        dynamic_mu=False,
+        dynamic_phi=True,
+        dynamic_g=True,
+        random_state=13,
+    ).fit(y, X)
+
+    components = model.predict_components(X)
+
+    assert np.allclose(components["mu"], components["mu"][0], atol=1e-10, rtol=0.0)
+    assert np.allclose(model.coef_mu_[1:], 0.0, atol=1e-12, rtol=0.0)
+
+
+def test_channel_restrictions_support_constant_mu_and_phi():
+    y, X = make_synthetic_pgarch_data(seed=14)
+    model = PGARCHLinearModel(
+        loss="qlike",
+        dynamic_mu=False,
+        dynamic_phi=False,
+        dynamic_g=True,
+        random_state=14,
+    ).fit(y, X)
+
+    components = model.predict_components(X)
+
+    assert np.allclose(components["mu"], components["mu"][0], atol=1e-10, rtol=0.0)
+    assert np.allclose(components["phi"], components["phi"][0], atol=1e-10, rtol=0.0)
+    assert np.allclose(model.coef_mu_[1:], 0.0, atol=1e-12, rtol=0.0)
+    assert np.allclose(model.coef_phi_[1:], 0.0, atol=1e-12, rtol=0.0)
+
+
 def test_score_metrics_supported():
     y, X = make_synthetic_pgarch_data(seed=8)
     model = PGARCHLinearModel(random_state=8).fit(y, X)

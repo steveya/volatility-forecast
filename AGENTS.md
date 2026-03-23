@@ -4,7 +4,7 @@
 
 You are working in the `volatility-forecast` repository. This repo owns canonical volatility-model code, reusable experiment drivers, evaluation logic, and tests. For the cross-repo workflow, model implementations belong here, not in the blog repo.
 
-This repo supports one long-running volatility forecasting workflow rather than a single PGARCH subproject. The current series frontier spans STES, XGBSTES, GARCH benchmarking under QLIKE, PGARCH variants, expanded feature work, and later VolGRU-style relaxations.
+This repo supports one long-running volatility forecasting workflow rather than a single PGARCH subproject. The accepted series frontier is currently `volatility-forecasts-6`: constant-`mu`, channel-allocated PGARCH with per-channel screening on the expanded feature tier. The active linear frontier is screened `PGARCH-L (K=5)`, and the active nonlinear frontier is screened `XGBPGARCH [gbtree-loose, K=5]`. Every post after Part 6 should be treated as a code-first search branch for a future frontier model: search and validation happen here in the package first, and the corresponding blog notebook should be written only after a candidate clears the agreed acceptance bar. The current contents of `volatility-forecasts-7` through `volatility-forecasts-10` are stale placeholders or archived drafts unless the user explicitly reopens or rewrites them.
 
 ## Scope
 
@@ -40,19 +40,34 @@ This file applies to the repo. Keep compatibility with alphaforge conventions an
 - Keep code modular. Promote reusable logic into package modules rather than burying it in notebooks or one-off scripts.
 - Prefer small, composable changes over broad refactors.
 - Treat model work as part of the broader volatility-series workflow, not as an isolated family-specific branch.
+- Treat Part 6 as the accepted continuation point, and treat every later post slot as a gated search branch for a future frontier model.
 - Record series rung, baseline family, candidate family, decision, and next branch in `../codex-workflows/volatility-forecasts-log.md` for substantive research iterations.
 - Separate experiment axes when possible:
   - feature changes should hold regularization and structure fixed
   - regularization changes should hold features and structure fixed
   - structural model changes should begin from a frozen feature tier and loss definition
+- On the accepted Part 6 frontier, hold these fixed unless the task explicitly studies a deviation:
+  - constant `mu`
+  - hard channel allocation (`mu` constant, `phi` and `g` from the expanded pool)
+  - per-channel screening as part of the model definition
+- For any post-6 frontier search work, follow a code-first gate:
+  - search for promising directions inside `volatility-forecast`
+  - validate the best candidate against the Part 6 comparison frame
+  - only after a candidate qualifies should the corresponding blog-side `posts/volatility-forecasts-*/draft.ipynb` be written
+- If no post-6 candidate qualifies, record the negative search honestly in the canonical log and do not force a new frontier notebook.
 - Keep tests aligned with agreed conventions and update them when behavior intentionally changes.
 
 ## Experiment Protocol
 
 - Start from an explicit baseline before introducing a candidate.
-- Name the baseline precisely: for example `GARCH(1,1)`, `STES`, `XGBSTES`, `PGARCH-L`, `XGB-g-PGARCH`, `XGBPGARCHModel`, or a `VolGRU` variant.
+- Name the baseline precisely: for example `GARCH(1,1)`, `STES`, `XGBSTES`, `PGARCH-L (3 feat, const mu)`, `PGARCH-L (hard alloc)`, `PGARCH-L (screened K=5)`, `XGB-g-PGARCH`, or `XGBPGARCH [gbtree-loose, screened K=5]`.
 - Hold the sample window, target, loss, and split constant while comparing a candidate to its baseline.
 - Compare serious candidates against `GARCH(1,1)` and the current family baseline when the series stage requires both.
+- For frontier-relevant Part 6 work, the default comparison frame is:
+  - `GARCH(1,1)` as the benchmark anchor
+  - screened `PGARCH-L (K=5)` as the linear family baseline
+  - screened `XGBPGARCH [gbtree-loose, K=5]` as the accepted nonlinear extension
+- For any post-6 frontier-search work, a candidate should not be treated as notebook-worthy unless it improves on the relevant Part 6 frontier model under the fixed comparison frame and has a defensible mechanism story.
 - Record whether the candidate changed:
   - features
   - regularization
@@ -69,6 +84,7 @@ This file applies to the repo. Keep compatibility with alphaforge conventions an
 - Report both point metrics and calibration-style diagnostics when they materially affect the conclusion.
 - Treat gains that appear only after repeated test-set peeking as invalid.
 - Prefer pruning weak directions quickly rather than expanding a high-capacity search with no validation support.
+- Do not treat all-feature allocations as the default frontier. On the accepted Part 6 tier, screening is part of the current winning comparison frame rather than an optional cosmetic add-on.
 
 ## Conventions
 
@@ -93,6 +109,7 @@ This file applies to the repo. Keep compatibility with alphaforge conventions an
 - Do not silently change train/test alignment, target alignment, or metric definitions.
 - Do not treat `outputs/` artifacts as a stable API contract.
 - Do not make avoidable interface changes without updating the dependent examples and tests.
+- Do not treat the current contents of `volatility-forecasts-7` through `volatility-forecasts-10` as the active frontier. Post-6 slots are gated search branches, not already-accepted results.
 
 ## Validation
 

@@ -279,6 +279,44 @@ def test_terminal_row_grad_hess_zero_for_all_channels():
         assert hess[-1] == 0.0
 
 
+def test_channel_specific_overrides_merge_into_channel_params():
+    model = XGBPGARCHModel(
+        learning_rate=0.1,
+        max_depth=4,
+        reg_lambda=0.1,
+        channel_param_overrides={"phi": {"learning_rate": 0.05, "max_depth": 2, "reg_lambda": 0.5}},
+        channel_trees_per_round={"g": 2},
+    )
+
+    phi_params = model._xgb_params("phi")
+    g_params = model._xgb_params("g")
+
+    assert phi_params["eta"] == 0.05
+    assert phi_params["max_depth"] == 2
+    assert phi_params["lambda"] == 0.5
+    assert g_params["eta"] == 0.1
+    assert g_params["max_depth"] == 4
+    assert g_params["lambda"] == 0.1
+    assert model._num_boost_round("phi") == 1
+    assert model._num_boost_round("g") == 2
+
+
+@pytest.mark.skipif(not HAS_XGBOOST, reason="xgboost not installed")
+def test_channel_specific_tree_budget_affects_booster_rounds():
+    y, X = make_synthetic_pgarch_data(seed=15)
+    model = XGBPGARCHModel(
+        loss="qlike",
+        n_outer_rounds=3,
+        trees_per_channel_per_round=1,
+        channel_trees_per_round={"g": 2},
+        random_state=15,
+    ).fit(y, X)
+
+    assert len(model.booster_mu_.get_dump()) == 3
+    assert len(model.booster_phi_.get_dump()) == 3
+    assert len(model.booster_g_.get_dump()) == 6
+
+
 @pytest.mark.skipif(not HAS_XGBOOST, reason="xgboost not installed")
 def test_initializer_modes_supported(monkeypatch: pytest.MonkeyPatch):
     y, X = make_synthetic_pgarch_data(seed=11)
@@ -352,3 +390,14 @@ def test_invalid_input_raises():
 
     with pytest.raises(ValueError, match="At least 3 observations"):
         model.fit(y[:2], X[:2])
+
+
+def test_invalid_channel_specific_overrides_raise():
+    with pytest.raises(ValueError, match="Unsupported channel override"):
+        XGBPGARCHModel(channel_param_overrides={"bad": {"max_depth": 2}})
+
+    with pytest.raises(ValueError, match="Unsupported per-channel XGBoost params"):
+        XGBPGARCHModel(channel_param_overrides={"phi": {"bad_param": 1}})
+
+    with pytest.raises(ValueError, match="channel_trees_per_round values must be positive"):
+        XGBPGARCHModel(channel_trees_per_round={"phi": 0})

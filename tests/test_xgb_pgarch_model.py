@@ -9,6 +9,7 @@ except ImportError:
     HAS_XGBOOST = False
 
 import volatility_forecast.model.xgb_pgarch_model as xgb_pgarch_module
+from volatility_forecast.model.pgarch_linear_model import PGARCHLinearModel
 from volatility_forecast.model.xgb_pgarch_model import XGBGPGARCHModel
 
 
@@ -235,6 +236,35 @@ def test_initializer_modes_supported(monkeypatch: pytest.MonkeyPatch):
             init_method="linear_pgarch", random_state=9
         ).fit(y, X)
     assert fallback_model.init_method_ == "intercept_only_pgarch"
+
+
+@pytest.mark.skipif(not HAS_XGBOOST, reason="xgboost not installed")
+def test_restricted_linear_initializer_is_supported():
+    y, X = make_synthetic_pgarch_data(seed=13)
+    initializer = PGARCHLinearModel(
+        loss="qlike",
+        dynamic_mu=False,
+        dynamic_phi=True,
+        dynamic_g=True,
+        random_state=13,
+    ).fit(y, X)
+
+    model = XGBGPGARCHModel(
+        loss="qlike",
+        init_model=initializer,
+        n_estimators=10,
+        learning_rate=0.1,
+        max_depth=2,
+        random_state=13,
+    ).fit(y, X)
+
+    init_components = initializer.predict_components(X)
+    boosted_components = model.predict_components(X)
+
+    assert model.init_method_ == "linear_pgarch"
+    assert np.allclose(boosted_components["mu"], init_components["mu"], atol=1e-10, rtol=0.0)
+    assert np.allclose(boosted_components["phi"], init_components["phi"], atol=1e-10, rtol=0.0)
+    assert np.allclose(boosted_components["mu"], boosted_components["mu"][0], atol=1e-10, rtol=0.0)
 
 
 def test_terminal_row_grad_hess_policy_is_consistent():

@@ -23,6 +23,18 @@ from .xgb_pgarch_model import (
 
 logger = logging.getLogger(__name__)
 
+CHANNEL_XGB_PARAM_MAP = {
+    "booster": "booster",
+    "learning_rate": "eta",
+    "max_depth": "max_depth",
+    "min_child_weight": "min_child_weight",
+    "subsample": "subsample",
+    "colsample_bytree": "colsample_bytree",
+    "reg_alpha": "alpha",
+    "reg_lambda": "lambda",
+    "gamma": "gamma",
+}
+
 
 class XGBPGARCHModel:
     """Full three-channel generalized boosted PGARCH model.
@@ -55,6 +67,8 @@ class XGBPGARCHModel:
         init_method: str = "linear_pgarch",
         init_model: object | None = None,
         channel_update_order: tuple[str, ...] = ("mu", "phi", "g"),
+        channel_param_overrides: dict[str, dict[str, Any]] | None = None,
+        channel_trees_per_round: dict[str, int] | None = None,
         early_stopping_rounds: int | None = None,
         eval_metric: str | None = None,
         random_state: int | None = None,
@@ -100,6 +114,23 @@ class XGBPGARCHModel:
             sorted(channel_update_order)
         ) != tuple(sorted(valid_channels)):
             raise ValueError("channel_update_order must contain each of 'mu', 'phi', and 'g' exactly once")
+        if channel_param_overrides is not None:
+            for channel, overrides in channel_param_overrides.items():
+                if channel not in valid_channels:
+                    raise ValueError(f"Unsupported channel override {channel!r}.")
+                unknown = set(overrides) - set(CHANNEL_XGB_PARAM_MAP)
+                if unknown:
+                    raise ValueError(
+                        "Unsupported per-channel XGBoost params: "
+                        f"{sorted(unknown)!r}."
+                    )
+                self._validate_channel_override_params(overrides)
+        if channel_trees_per_round is not None:
+            for channel, num_rounds in channel_trees_per_round.items():
+                if channel not in valid_channels:
+                    raise ValueError(f"Unsupported channel tree-budget override {channel!r}.")
+                if int(num_rounds) <= 0:
+                    raise ValueError("channel_trees_per_round values must be positive.")
         if early_stopping_rounds is not None and early_stopping_rounds <= 0:
             raise ValueError("early_stopping_rounds must be positive when provided")
         if eval_metric not in valid_eval_metrics:
@@ -125,6 +156,14 @@ class XGBPGARCHModel:
         self.init_method = init_method
         self.init_model = init_model
         self.channel_update_order = tuple(channel_update_order)
+        self.channel_param_overrides = {
+            channel: dict(overrides)
+            for channel, overrides in (channel_param_overrides or {}).items()
+        }
+        self.channel_trees_per_round = {
+            channel: int(num_rounds)
+            for channel, num_rounds in (channel_trees_per_round or {}).items()
+        }
         self.early_stopping_rounds = early_stopping_rounds
         self.eval_metric = eval_metric
         self.random_state = random_state
@@ -696,9 +735,9 @@ class XGBPGARCHModel:
             return grad_fn_map[channel](y, state)
 
         train_kwargs: dict[str, Any] = {
-            "params": self._xgb_params(),
+            "params": self._xgb_params(channel),
             "dtrain": dtrain,
-            "num_boost_round": self.trees_per_channel_per_round,
+            "num_boost_round": self._num_boost_round(channel),
             "obj": objective,
             "xgb_model": booster_map[channel],
         }
@@ -841,7 +880,10 @@ class XGBPGARCHModel:
         hess[-1] = 0.0
         return grad, hess
 
-    def _xgb_params(self) -> dict[str, Any]:
+    def _num_boost_round(self, channel: str) -> int:
+        return int(self.channel_trees_per_round.get(channel, self.trees_per_channel_per_round))
+
+    def _xgb_params(self, channel: str | None = None) -> dict[str, Any]:
         params: dict[str, Any] = {
             "booster": self.booster,
             "eta": self.learning_rate,
@@ -856,9 +898,38 @@ class XGBPGARCHModel:
             "objective": "reg:squarederror",
             "base_score": 0.0,
         }
+        if channel is not None:
+            for key, value in self.channel_param_overrides.get(channel, {}).items():
+                params[CHANNEL_XGB_PARAM_MAP[key]] = value
         if self.random_state is not None:
             params["seed"] = int(self.random_state)
         return params
+
+    @staticmethod
+    def _validate_channel_override_params(overrides: dict[str, Any]) -> None:
+        if "booster" in overrides and overrides["booster"] not in {"gbtree", "gblinear"}:
+            raise ValueError("Per-channel booster must be one of ['gblinear', 'gbtree'].")
+        if "learning_rate" in overrides:
+            value = float(overrides["learning_rate"])
+            if value <= 0.0 or not np.isfinite(value):
+                raise ValueError("Per-channel learning_rate must be finite and > 0.")
+        if "max_depth" in overrides and int(overrides["max_depth"]) < 0:
+            raise ValueError("Per-channel max_depth must be >= 0.")
+        if "min_child_weight" in overrides:
+            value = float(overrides["min_child_weight"])
+            if value <= 0.0 or not np.isfinite(value):
+                raise ValueError("Per-channel min_child_weight must be finite and > 0.")
+        if "subsample" in overrides:
+            value = float(overrides["subsample"])
+            if not (0.0 < value <= 1.0):
+                raise ValueError("Per-channel subsample must be in (0, 1].")
+        if "colsample_bytree" in overrides:
+            value = float(overrides["colsample_bytree"])
+            if not (0.0 < value <= 1.0):
+                raise ValueError("Per-channel colsample_bytree must be in (0, 1].")
+        for key in ("reg_alpha", "reg_lambda", "gamma"):
+            if key in overrides and float(overrides[key]) < 0.0:
+                raise ValueError(f"Per-channel {key} must be >= 0.")
 
     def _predict_margin(self, booster: Any, X: np.ndarray, channel: str | None = None) -> np.ndarray:
         dmatrix = self._make_dmatrix(X, channel=channel)
