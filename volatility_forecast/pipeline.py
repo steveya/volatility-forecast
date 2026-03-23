@@ -5,25 +5,24 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
-
+from alphaforge.data.cache import CacheBackend
 from alphaforge.data.context import DataContext
 from alphaforge.data.query import Query
+from alphaforge.features.dataset_builder import build_dataset
 
 # New scalable dataset API
 from alphaforge.features.dataset_spec import (
     DatasetSpec,
-    UniverseSpec,
-    TimeSpec,
     FeatureRequest,
-    TargetRequest,
     JoinPolicy,
     MissingnessPolicy,
+    TargetRequest,
+    TimeSpec,
+    UniverseSpec,
 )
-from alphaforge.features.dataset_builder import build_dataset
+from alphaforge.store.raw_data_store import RawDataStore
 
 from .sources.tiingo_eod import TiingoEODSource
-from alphaforge.data.cache import CacheBackend
-from alphaforge.store.raw_data_store import RawDataStore
 
 
 @dataclass(frozen=True)
@@ -61,11 +60,15 @@ def build_default_ctx(
     """Construct a default Alphaforge DataContext for the vol domain.
 
     Uses:
-    - TiingoEODSource for daily adjusted OHLCV
+    - TiingoEODSource for daily adjusted OHLCV (legacy ``sources`` path)
+    - TiingoAdapter for unified ``ctx.fetch()`` path
     - LocalParquetStore for caching materializations
     """
-    from alphaforge.time.calendar import TradingCalendar
+    import os
+
+    from alphaforge.data.sources.tiingo import TiingoAdapter
     from alphaforge.store.duckdb_parquet import DuckDBParquetStore
+    from alphaforge.time.calendar import TradingCalendar
 
     cal = TradingCalendar("XNYS", tz="UTC")
     src = TiingoEODSource(
@@ -76,12 +79,18 @@ def build_default_ctx(
     )
     store = DuckDBParquetStore(root=".af_store")
 
+    # Resolve Tiingo API key for the unified adapter
+    api_key = tiingo_api_key or os.environ.get("TIINGO_API_KEY", "")
+    tiingo_adapter = TiingoAdapter(api_key=api_key)
+
     return DataContext(
         sources={"tiingo": src},
         calendars={"XNYS": cal},
         store=store,
         universe=None,
         entity_meta=None,
+        adapters={"tiingo": tiingo_adapter},
+        default_sources={"market.ohlcv": "tiingo"},
     )
 
 
