@@ -10,6 +10,8 @@ from typing import Any
 import numpy as np
 from scipy.optimize import minimize
 
+from .pgarch_channel_heads import XGBChannelHeadPlan
+from .pgarch_core import PGARCHBounds, PGARCHCore
 from .xgb_pgarch_model import (
     PGARCHLinearModel,
     _ConstantPGARCHInitializer,
@@ -22,18 +24,6 @@ from .xgb_pgarch_model import (
 )
 
 logger = logging.getLogger(__name__)
-
-CHANNEL_XGB_PARAM_MAP = {
-    "booster": "booster",
-    "learning_rate": "eta",
-    "max_depth": "max_depth",
-    "min_child_weight": "min_child_weight",
-    "subsample": "subsample",
-    "colsample_bytree": "colsample_bytree",
-    "reg_alpha": "alpha",
-    "reg_lambda": "lambda",
-    "gamma": "gamma",
-}
 
 
 class XGBPGARCHModel:
@@ -114,23 +104,6 @@ class XGBPGARCHModel:
             sorted(channel_update_order)
         ) != tuple(sorted(valid_channels)):
             raise ValueError("channel_update_order must contain each of 'mu', 'phi', and 'g' exactly once")
-        if channel_param_overrides is not None:
-            for channel, overrides in channel_param_overrides.items():
-                if channel not in valid_channels:
-                    raise ValueError(f"Unsupported channel override {channel!r}.")
-                unknown = set(overrides) - set(CHANNEL_XGB_PARAM_MAP)
-                if unknown:
-                    raise ValueError(
-                        "Unsupported per-channel XGBoost params: "
-                        f"{sorted(unknown)!r}."
-                    )
-                self._validate_channel_override_params(overrides)
-        if channel_trees_per_round is not None:
-            for channel, num_rounds in channel_trees_per_round.items():
-                if channel not in valid_channels:
-                    raise ValueError(f"Unsupported channel tree-budget override {channel!r}.")
-                if int(num_rounds) <= 0:
-                    raise ValueError("channel_trees_per_round values must be positive.")
         if early_stopping_rounds is not None and early_stopping_rounds <= 0:
             raise ValueError("early_stopping_rounds must be positive when provided")
         if eval_metric not in valid_eval_metrics:
@@ -170,6 +143,18 @@ class XGBPGARCHModel:
         self.verbosity = int(verbosity)
         self.channel_features = channel_features
         self.booster = booster
+        self._core = PGARCHCore(
+            loss=self.loss,
+            bounds=PGARCHBounds(
+                mu_min=self.mu_min,
+                phi_min=self.phi_min,
+                phi_max=self.phi_max,
+                g_min=self.g_min,
+                g_max=self.g_max,
+                h_min=self.h_min,
+            ),
+        )
+        self._channel_head_plan()
 
         self.booster_mu_: Any = None
         self.booster_phi_: Any = None
@@ -438,14 +423,15 @@ class XGBPGARCHModel:
             raise ValueError("Baseline g must lie in (0, 1).")
 
         h = np.maximum(h, self.h_min)
+        scores = self._core.inverse_link_scores(mu, phi, g)
         return {
             "mu": mu,
             "phi": phi,
             "g": g,
             "h": h,
-            "a0": self._inverse_link_mu(mu),
-            "b0": self._inverse_link_phi(phi),
-            "c0": self._inverse_link_g(g),
+            "a0": scores.a,
+            "b0": scores.b,
+            "c0": scores.c,
         }
 
     def _initialize_raw_scores(
@@ -466,9 +452,14 @@ class XGBPGARCHModel:
             raise ValueError("Initializer is not available.")
 
         components = self.initializer_.predict_components(X)
-        a = self._inverse_link_mu(np.asarray(components["mu"], dtype=float))
-        b = self._inverse_link_phi(np.asarray(components["phi"], dtype=float))
-        c = self._inverse_link_g(np.asarray(components["g"], dtype=float))
+        scores = self._core.inverse_link_scores(
+            np.asarray(components["mu"], dtype=float),
+            np.asarray(components["phi"], dtype=float),
+            np.asarray(components["g"], dtype=float),
+        )
+        a = scores.a
+        b = scores.b
+        c = scores.c
 
         if self.booster_mu_ is not None:
             a = a + self._predict_margin(self.booster_mu_, X_np, channel="mu")
@@ -479,45 +470,31 @@ class XGBPGARCHModel:
         return a, b, c
 
     def _link_mu(self, a: np.ndarray) -> np.ndarray:
-        a_np = np.asarray(a, dtype=float)
-        return self.mu_min + np.asarray(_softplus(a_np), dtype=float)
+        return self._core.link_mu(a)
 
     def _link_phi(self, b: np.ndarray) -> np.ndarray:
-        b_np = np.asarray(b, dtype=float)
-        sigma = np.asarray(_sigmoid(b_np), dtype=float)
-        return self.phi_min + (self.phi_max - self.phi_min) * sigma
+        return self._core.link_phi(b)
 
     def _link_g(self, c: np.ndarray) -> np.ndarray:
-        c_np = np.asarray(c, dtype=float)
-        sigma = np.asarray(_sigmoid(c_np), dtype=float)
-        return self.g_min + (self.g_max - self.g_min) * sigma
+        return self._core.link_g(c)
 
     def _link_mu_prime(self, a: np.ndarray) -> np.ndarray:
-        return np.asarray(_sigmoid(np.asarray(a, dtype=float)), dtype=float)
+        return self._core.link_mu_prime(a)
 
     def _link_phi_prime(self, b: np.ndarray) -> np.ndarray:
-        b_np = np.asarray(b, dtype=float)
-        sigma = np.asarray(_sigmoid(b_np), dtype=float)
-        return (self.phi_max - self.phi_min) * sigma * (1.0 - sigma)
+        return self._core.link_phi_prime(b)
 
     def _link_g_prime(self, c: np.ndarray) -> np.ndarray:
-        c_np = np.asarray(c, dtype=float)
-        sigma = np.asarray(_sigmoid(c_np), dtype=float)
-        return (self.g_max - self.g_min) * sigma * (1.0 - sigma)
+        return self._core.link_g_prime(c)
 
     def _inverse_link_mu(self, mu: np.ndarray) -> np.ndarray:
-        mu_np = np.asarray(mu, dtype=float)
-        return np.asarray(_softplus_inverse(mu_np - self.mu_min), dtype=float)
+        return self._core.inverse_link_mu(mu)
 
     def _inverse_link_phi(self, phi: np.ndarray) -> np.ndarray:
-        phi_np = np.asarray(phi, dtype=float)
-        scaled = (phi_np - self.phi_min) / (self.phi_max - self.phi_min)
-        return np.asarray(_logit(scaled), dtype=float)
+        return self._core.inverse_link_phi(phi)
 
     def _inverse_link_g(self, g: np.ndarray) -> np.ndarray:
-        g_np = np.asarray(g, dtype=float)
-        scaled = (g_np - self.g_min) / (self.g_max - self.g_min)
-        return np.asarray(_logit(scaled), dtype=float)
+        return self._core.inverse_link_g(g)
 
     def _forward_recursion_with_scores(
         self,
@@ -528,101 +505,16 @@ class XGBPGARCHModel:
         *,
         h0: float,
     ) -> dict[str, np.ndarray]:
-        y_np = np.asarray(y, dtype=float)
-        a_np = np.asarray(a, dtype=float)
-        b_np = np.asarray(b, dtype=float)
-        c_np = np.asarray(c, dtype=float)
-        T = len(y_np)
-
-        for name, arr in {"a": a_np, "b": b_np, "c": c_np}.items():
-            if arr.shape != (T,):
-                raise ValueError(f"{name} must have shape {(T,)}, got {arr.shape}.")
-
-        mu = self._link_mu(a_np)
-        phi = self._link_phi(b_np)
-        g = self._link_g(c_np)
-        mu_prime = self._link_mu_prime(a_np)
-        phi_prime = self._link_phi_prime(b_np)
-        g_prime = self._link_g_prime(c_np)
-
-        h = np.empty(T, dtype=float)
-        h[0] = max(float(h0), self.h_min)
-        q = np.zeros(T, dtype=float)
-        rho = np.zeros(T, dtype=float)
-        local_impulse_mu = np.zeros(T, dtype=float)
-        local_impulse_phi = np.zeros(T, dtype=float)
-        local_impulse_g = np.zeros(T, dtype=float)
-        floor_active = np.zeros(T, dtype=bool)
-
-        for row in range(T - 1):
-            q[row] = g[row] * y_np[row] + (1.0 - g[row]) * h[row]
-            h_raw_next = (1.0 - phi[row]) * mu[row] + phi[row] * q[row]
-            if h_raw_next <= self.h_min:
-                h[row + 1] = self.h_min
-                rho[row] = 0.0
-                local_impulse_mu[row] = 0.0
-                local_impulse_phi[row] = 0.0
-                local_impulse_g[row] = 0.0
-                floor_active[row] = True
-                continue
-
-            h[row + 1] = h_raw_next
-            rho[row] = phi[row] * (1.0 - g[row])
-            local_impulse_mu[row] = (1.0 - phi[row]) * mu_prime[row]
-            local_impulse_phi[row] = (q[row] - mu[row]) * phi_prime[row]
-            local_impulse_g[row] = phi[row] * (y_np[row] - h[row]) * g_prime[row]
-
-        q[-1] = g[-1] * y_np[-1] + (1.0 - g[-1]) * h[-1]
-        return {
-            "a": a_np,
-            "b": b_np,
-            "c": c_np,
-            "mu": mu,
-            "phi": phi,
-            "g": g,
-            "mu_prime": mu_prime,
-            "phi_prime": phi_prime,
-            "g_prime": g_prime,
-            "h": h,
-            "q": q,
-            "rho": rho,
-            "local_impulse_mu": local_impulse_mu,
-            "local_impulse_phi": local_impulse_phi,
-            "local_impulse_g": local_impulse_g,
-            "floor_active": floor_active,
-        }
+        return self._core.forward_with_scores(y, a=a, b=b, c=c, h0=h0).as_dict()
 
     def _loss_from_state(self, y: np.ndarray, h: np.ndarray) -> float:
-        y_np = np.asarray(y, dtype=float)
-        h_safe = np.maximum(np.asarray(h, dtype=float), self.h_min)
-        y_eff = y_np[1:]
-        h_eff = h_safe[1:]
-        if self._optimization_loss_name == "mse":
-            return float(np.mean((y_eff - h_eff) ** 2))
-        return float(np.mean(np.log(h_eff) + y_eff / h_eff))
+        return self._core.loss_from_variance(y, h)
 
     def _loss_grad_wrt_h(self, y: np.ndarray, h: np.ndarray) -> np.ndarray:
-        y_np = np.asarray(y, dtype=float)
-        h_safe = np.maximum(np.asarray(h, dtype=float), self.h_min)
-        grad = np.zeros_like(h_safe)
-        n_eff = float(len(y_np) - 1)
-        if self._optimization_loss_name == "mse":
-            grad[1:] = 2.0 * (h_safe[1:] - y_np[1:]) / n_eff
-            return grad
-        grad[1:] = (1.0 / h_safe[1:] - y_np[1:] / (h_safe[1:] ** 2)) / n_eff
-        return grad
+        return self._core.loss_grad_wrt_h(y, h)
 
     def _loss_hess_weight_wrt_h(self, y: np.ndarray, h: np.ndarray) -> np.ndarray:
-        y_np = np.asarray(y, dtype=float)
-        h_safe = np.maximum(np.asarray(h, dtype=float), self.h_min)
-        weight = np.zeros_like(h_safe)
-        n_eff = float(len(y_np) - 1)
-        if self._optimization_loss_name == "mse":
-            weight[1:] = 2.0 / n_eff
-            return weight
-        weight[1:] = 1.0 / (n_eff * (h_safe[1:] ** 2))
-        weight[1:] = np.clip(weight[1:], 1e-12, 1e12)
-        return weight
+        return self._core.loss_hess_weight_wrt_h(y, h)
 
     def _backward_adjoint(
         self,
@@ -832,12 +724,14 @@ class XGBPGARCHModel:
 
         def objective(theta: np.ndarray) -> float:
             mu, phi, g = unpack(theta)
-            h = np.empty(len(y_np), dtype=float)
-            h[0] = h0
-            for row in range(len(y_np) - 1):
-                q_row = g * y_np[row] + (1.0 - g) * h[row]
-                h[row + 1] = max((1.0 - phi) * mu + phi * q_row, self.h_min)
-            return self._loss_from_state(y_np, h)
+            h = self._core.variance_path_from_components(
+                y_np,
+                mu=np.full(len(y_np), mu, dtype=float),
+                phi=np.full(len(y_np), phi, dtype=float),
+                g=np.full(len(y_np), g, dtype=float),
+                h0=h0,
+            )
+            return self._core.loss_from_variance(y_np, h)
 
         result = minimize(objective, theta0, method="L-BFGS-B")
         if not bool(result.success):
@@ -881,72 +775,35 @@ class XGBPGARCHModel:
         return grad, hess
 
     def _num_boost_round(self, channel: str) -> int:
-        return int(self.channel_trees_per_round.get(channel, self.trees_per_channel_per_round))
+        return self._channel_head_plan().num_boost_round(channel)
 
     def _xgb_params(self, channel: str | None = None) -> dict[str, Any]:
-        params: dict[str, Any] = {
-            "booster": self.booster,
-            "eta": self.learning_rate,
-            "max_depth": self.max_depth,
-            "min_child_weight": self.min_child_weight,
-            "subsample": self.subsample,
-            "colsample_bytree": self.colsample_bytree,
-            "alpha": self.reg_alpha,
-            "lambda": self.reg_lambda,
-            "gamma": self.gamma,
-            "verbosity": self.verbosity,
-            "objective": "reg:squarederror",
-            "base_score": 0.0,
-        }
-        if channel is not None:
-            for key, value in self.channel_param_overrides.get(channel, {}).items():
-                params[CHANNEL_XGB_PARAM_MAP[key]] = value
-        if self.random_state is not None:
-            params["seed"] = int(self.random_state)
-        return params
+        return self._channel_head_plan().params_for(channel)
 
-    @staticmethod
-    def _validate_channel_override_params(overrides: dict[str, Any]) -> None:
-        if "booster" in overrides and overrides["booster"] not in {"gbtree", "gblinear"}:
-            raise ValueError("Per-channel booster must be one of ['gblinear', 'gbtree'].")
-        if "learning_rate" in overrides:
-            value = float(overrides["learning_rate"])
-            if value <= 0.0 or not np.isfinite(value):
-                raise ValueError("Per-channel learning_rate must be finite and > 0.")
-        if "max_depth" in overrides and int(overrides["max_depth"]) < 0:
-            raise ValueError("Per-channel max_depth must be >= 0.")
-        if "min_child_weight" in overrides:
-            value = float(overrides["min_child_weight"])
-            if value <= 0.0 or not np.isfinite(value):
-                raise ValueError("Per-channel min_child_weight must be finite and > 0.")
-        if "subsample" in overrides:
-            value = float(overrides["subsample"])
-            if not (0.0 < value <= 1.0):
-                raise ValueError("Per-channel subsample must be in (0, 1].")
-        if "colsample_bytree" in overrides:
-            value = float(overrides["colsample_bytree"])
-            if not (0.0 < value <= 1.0):
-                raise ValueError("Per-channel colsample_bytree must be in (0, 1].")
-        for key in ("reg_alpha", "reg_lambda", "gamma"):
-            if key in overrides and float(overrides[key]) < 0.0:
-                raise ValueError(f"Per-channel {key} must be >= 0.")
+    def _channel_head_plan(self) -> XGBChannelHeadPlan:
+        return XGBChannelHeadPlan(
+            booster=self.booster,
+            learning_rate=self.learning_rate,
+            max_depth=self.max_depth,
+            min_child_weight=self.min_child_weight,
+            subsample=self.subsample,
+            colsample_bytree=self.colsample_bytree,
+            reg_alpha=self.reg_alpha,
+            reg_lambda=self.reg_lambda,
+            gamma=self.gamma,
+            trees_per_channel_per_round=self.trees_per_channel_per_round,
+            channel_param_overrides=self.channel_param_overrides,
+            channel_trees_per_round=self.channel_trees_per_round,
+            random_state=self.random_state,
+            verbosity=self.verbosity,
+        )
 
     def _predict_margin(self, booster: Any, X: np.ndarray, channel: str | None = None) -> np.ndarray:
         dmatrix = self._make_dmatrix(X, channel=channel)
         return np.asarray(booster.predict(dmatrix, output_margin=True), dtype=float)
 
     def _score_from_state(self, y: np.ndarray, h: np.ndarray, metric: str) -> float:
-        y_np = np.asarray(y, dtype=float)
-        h_safe = np.maximum(np.asarray(h, dtype=float), self.h_min)
-        y_eff = y_np[1:]
-        h_eff = h_safe[1:]
-        if metric == "mse":
-            return float(np.mean((y_eff - h_eff) ** 2))
-        if metric == "rmse":
-            return float(np.sqrt(np.mean((y_eff - h_eff) ** 2)))
-        if metric == "qlike":
-            return float(np.mean(np.log(h_eff) + y_eff / h_eff))
-        raise ValueError(f"metric must be one of ['mse', 'rmse', 'qlike'], got {metric!r}.")
+        return self._core.score_from_variance(y, h, metric)
 
     def _snapshot_boosters(self) -> dict[str, Any]:
         return {

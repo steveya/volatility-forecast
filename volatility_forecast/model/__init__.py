@@ -1,5 +1,7 @@
 from .stes_model import STESModel
+from .pgarch_core import PGARCHBounds, PGARCHCore, PGARCHRawScores, PGARCHRecursionState, blend_raw_scores
 from .pgarch_linear_model import PGARCHLinearModel
+from .pgarch_channel_heads import XGBChannelHeadPlan
 from .xgb_pgarch_full_model import XGBPGARCHModel
 from .xgb_pgarch_model import XGBGPGARCHModel
 from .tree_stes_model import XGBoostSTESModel
