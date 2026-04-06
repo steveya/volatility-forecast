@@ -7,7 +7,6 @@ import pandas as pd
 try:
     from alphaforge.data.context import DataContext
     from alphaforge.data.query import Query
-    from alphaforge.features.dataset_spec import TargetRequest
     from alphaforge.features.template import ParamSpec, SliceSpec
     from alphaforge.features.frame import FeatureFrame
     from alphaforge.features.ids import make_feature_id, group_path
@@ -22,13 +21,6 @@ except ImportError:
     class ParamSpec:  # type: ignore[no-redef]
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             pass
-
-    class TargetRequest:  # type: ignore[no-redef]
-        def __init__(self, **kwargs: Any) -> None:
-            self.template = kwargs.get("template")
-            self.params = kwargs.get("params")
-            self.horizon = kwargs.get("horizon")
-            self.name = kwargs.get("name")
 
     SliceSpec = object  # type: ignore[misc,assignment]
 
@@ -149,9 +141,23 @@ def forward_realized_variance_from_log_returns(
         raise ValueError("annualize_to must be positive")
 
     squared = pd.Series(np.square(logret.astype(float)), index=logret.index)
-    future_terms = [_entity_shift(squared, -step) for step in range(1, horizon + 1)]
-    future_panel = pd.concat(future_terms, axis=1)
-    future_sum = future_panel.sum(axis=1, min_count=horizon)
+    next_squared = _entity_shift(squared, -1)
+    if isinstance(next_squared.index, pd.MultiIndex) and "entity_id" in next_squared.index.names:
+        future_sum = next_squared.groupby(
+            level="entity_id", sort=False, group_keys=False
+        ).apply(
+            lambda s: s.iloc[::-1]
+            .rolling(window=horizon, min_periods=horizon)
+            .sum()
+            .iloc[::-1]
+        )
+    else:
+        future_sum = (
+            next_squared.iloc[::-1]
+            .rolling(window=horizon, min_periods=horizon)
+            .sum()
+            .iloc[::-1]
+        )
     return future_sum * (annualize / float(horizon))
 
 

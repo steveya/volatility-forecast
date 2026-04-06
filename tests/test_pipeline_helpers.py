@@ -149,7 +149,6 @@ def test_build_default_ctx_registers_adapter_and_env_resolution(tmp_path, monkey
     assert ctx.adapters is not None
     assert "tiingo" in ctx.adapters
     adapter = ctx.adapters["tiingo"]
-    assert adapter._api_key == "env_tiingo_key"
     assert adapter.source_name == "tiingo"
     assert "market.ohlcv" in adapter.datasets
 

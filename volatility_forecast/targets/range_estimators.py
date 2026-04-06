@@ -273,7 +273,6 @@ class IntradayRealizedVarianceTarget:
             source=source,
         )
         df = frame.reset_index()
-        # detect a datetime column (supports timezone-aware dtypes)
         # Detect a datetime column (supports timezone-aware dtypes)
         # Avoid deprecated pandas API `is_datetime64tz_dtype` by checking the dtype class.
         from pandas.api.types import is_datetime64_any_dtype
