@@ -10,6 +10,7 @@ try:
     from alphaforge.features.template import ParamSpec, SliceSpec
     from alphaforge.features.frame import FeatureFrame
     from alphaforge.features.ids import make_feature_id, group_path
+    from volatility_forecast.market_data import load_market_frame
 except ImportError:
     DataContext = object  # type: ignore[misc,assignment]
 
@@ -32,6 +33,9 @@ except ImportError:
 
     def group_path(*args: Any, **kwargs: Any) -> str:  # type: ignore[misc]
         return ""
+
+    def load_market_frame(*args: Any, **kwargs: Any) -> pd.DataFrame:  # type: ignore[misc]
+        return pd.DataFrame()
 
 
 class NextDaySquaredReturnTarget:
@@ -69,24 +73,23 @@ class NextDaySquaredReturnTarget:
         )
         scale = float(params.get("scale", 1.0))
 
-        panel = ctx.fetch_panel(
-            source,
-            Query(
-                table=table,
-                columns=[price_col],
-                start=slice.start,
-                end=slice.end,
-                entities=slice.entities,
-                asof=slice.asof,
-                grid=slice.grid,
-            ),
+        frame = load_market_frame(
+            ctx,
+            dataset=table,
+            columns=[price_col],
+            start=slice.start,
+            end=slice.end,
+            entities=slice.entities,
+            asof=slice.asof,
+            grid=slice.grid,
+            source=source,
         )
-        px = panel.df[price_col].astype(float)
+        px = frame[price_col].astype(float)
         logret = np.log(px).groupby(level="entity_id").diff()
         y = (logret.groupby(level="entity_id").shift(-1) ** 2) * scale  # next-day
 
         fid = make_feature_id(table, "*", "target", "nextday_sqret", {"scale": scale})
-        X = pd.DataFrame({fid: y}, index=panel.df.index).sort_index()
+        X = pd.DataFrame({fid: y}, index=frame.index).sort_index()
         catalog = pd.DataFrame(
             [
                 {
@@ -98,6 +101,154 @@ class NextDaySquaredReturnTarget:
                     "transform": "nextday_sqret",
                     "source_table": table,
                     "source_col": price_col,
+                }
+            ]
+        ).set_index("feature_id")
+        return FeatureFrame(
+            X=X, catalog=catalog, meta={"template": self.name, "version": self.version}
+        )
+
+
+def _entity_shift(series: pd.Series, periods: int) -> pd.Series:
+    if isinstance(series.index, pd.MultiIndex) and "entity_id" in series.index.names:
+        return series.groupby(level="entity_id").shift(periods)
+    return series.shift(periods)
+
+
+def forward_realized_variance_from_log_returns(
+    logret: pd.Series,
+    *,
+    horizon_bars: int,
+    annualize_to: float = 252.0,
+) -> pd.Series:
+    """Annualized forward realized variance indexed at forecast origin t.
+
+    Computes
+
+        annualize_to / H * sum_{j=1}^H r_{t+j}^2
+
+    where r_{t+j} is the close-to-close log return. The final H rows are NaN
+    because a full future window is required. The value stored at index t uses
+    only future returns r_{t+1} through r_{t+H}; neither the contemporaneous
+    return at t nor any prior return contributes to the target.
+    """
+
+    horizon = int(horizon_bars)
+    if horizon <= 0:
+        raise ValueError("horizon_bars must be positive")
+    annualize = float(annualize_to)
+    if annualize <= 0.0:
+        raise ValueError("annualize_to must be positive")
+
+    squared = pd.Series(np.square(logret.astype(float)), index=logret.index)
+    next_squared = _entity_shift(squared, -1)
+    if isinstance(next_squared.index, pd.MultiIndex) and "entity_id" in next_squared.index.names:
+        future_sum = next_squared.groupby(
+            level="entity_id", sort=False, group_keys=False
+        ).apply(
+            lambda s: s.iloc[::-1]
+            .rolling(window=horizon, min_periods=horizon)
+            .sum()
+            .iloc[::-1]
+        )
+    else:
+        future_sum = (
+            next_squared.iloc[::-1]
+            .rolling(window=horizon, min_periods=horizon)
+            .sum()
+            .iloc[::-1]
+        )
+    return future_sum * (annualize / float(horizon))
+
+
+class ForwardRealizedVarianceTarget:
+    """Annualized forward realized variance indexed at forecast origin t.
+
+    The target at row t is
+
+        annualize_to / H * sum_{j=1}^H r_{t+j}^2
+
+    based on future close-to-close daily log returns.
+
+    The final ``horizon_bars`` rows are undefined because the full future
+    window is not available. Downstream dataset builders may safely drop those
+    rows after target construction without introducing look-ahead, provided the
+    feature matrix is aligned on the same forecast-origin index.
+    """
+
+    name = "target_forward_realized_variance"
+    version = "1.0"
+    param_space = {
+        "source": ParamSpec(
+            "categorical", default="tiingo", choices=["tiingo", "simulated_garch"]
+        ),
+        "table": ParamSpec(
+            "categorical", default="market.ohlcv", choices=["market.ohlcv"]
+        ),
+        "price_col": ParamSpec("categorical", default="close", choices=["close"]),
+        "horizon_bars": ParamSpec("int", default=63, low=1, high=252),
+        "annualize_to": ParamSpec("float", default=252.0, low=1.0),
+    }
+
+    def requires(self, params: Dict[str, Any]) -> List[Tuple[str, Query]]:
+        return []
+
+    def fit(self, ctx: DataContext, params: Dict[str, Any], fit_slice: SliceSpec):
+        return None
+
+    def transform(
+        self, ctx: DataContext, params: Dict[str, Any], slice: SliceSpec, state
+    ):
+        source, table, price_col = (
+            params["source"],
+            params["table"],
+            params["price_col"],
+        )
+        horizon_bars = int(params.get("horizon_bars", 63))
+        annualize_to = float(params.get("annualize_to", 252.0))
+
+        frame = load_market_frame(
+            ctx,
+            dataset=table,
+            columns=[price_col],
+            start=slice.start,
+            end=slice.end,
+            entities=slice.entities,
+            asof=slice.asof,
+            grid=slice.grid,
+            source=source,
+        )
+        px = frame[price_col].astype(float)
+        logret = np.log(px).groupby(level="entity_id").diff()
+        y = forward_realized_variance_from_log_returns(
+            logret,
+            horizon_bars=horizon_bars,
+            annualize_to=annualize_to,
+        )
+
+        fid = make_feature_id(
+            table,
+            "*",
+            "target",
+            "forward_realized_variance",
+            {"horizon_bars": horizon_bars, "annualize_to": annualize_to},
+        )
+        X = pd.DataFrame({fid: y}, index=frame.index).sort_index()
+        catalog = pd.DataFrame(
+            [
+                {
+                    "feature_id": fid,
+                    "group_path": group_path(
+                        "target",
+                        "forward_realized_variance",
+                        {"horizon_bars": horizon_bars, "annualize_to": annualize_to},
+                    ),
+                    "family": "target",
+                    "transform": "forward_realized_variance",
+                    "source_table": table,
+                    "source_col": price_col,
+                    "horizon_bars": horizon_bars,
+                    "annualize_to": annualize_to,
                 }
             ]
         ).set_index("feature_id")

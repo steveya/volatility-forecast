@@ -9,11 +9,11 @@ import pytest
 from datetime import datetime, timedelta
 
 pytest.importorskip("alphaforge")
+pytest.importorskip("esig")
 
 from volatility_forecast.features.signature_features import SignatureFeaturesTemplate
-from volatility_forecast.sources.simulated_garch import SimulatedGARCHSource
+from volatility_forecast.sources.simulated_garch import SimulatedGARCHAdapter
 from volatility_forecast.pipeline import build_default_ctx
-from alphaforge.data.context import DataContext
 from alphaforge.features.template import SliceSpec
 
 
@@ -22,12 +22,10 @@ class TestSignatureFeaturesTemplate(unittest.TestCase):
 
     def setUp(self):
         """Set up test context and data."""
-        self.ctx = build_default_ctx()
         self.entity = "TEST_ENTITY"
         self.source_name = "simulated_garch"
 
-        # Add simulated GARCH source
-        sim_source = SimulatedGARCHSource(
+        sim_adapter = SimulatedGARCHAdapter(
             entity_id=self.entity,
             n_periods=2500,
             random_state=42,
@@ -38,7 +36,7 @@ class TestSignatureFeaturesTemplate(unittest.TestCase):
             eta=4.0,
             shock_prob=0.005,
         )
-        self.ctx.sources[self.source_name] = sim_source
+        self.ctx = build_default_ctx(extra_adapters=(sim_adapter,))
 
         self.template = SignatureFeaturesTemplate()
 
@@ -377,12 +375,10 @@ class TestSignatureFeatureIntegration(unittest.TestCase):
 
     def setUp(self):
         """Set up test context."""
-        self.ctx = build_default_ctx()
         self.entity = "INTEGRATION_TEST"
         self.source_name = "simulated_garch"
 
-        # Add simulated GARCH source with different parameters
-        sim_source = SimulatedGARCHSource(
+        sim_adapter = SimulatedGARCHAdapter(
             entity_id=self.entity,
             n_periods=2500,
             random_state=123,
@@ -393,7 +389,7 @@ class TestSignatureFeatureIntegration(unittest.TestCase):
             eta=4.0,
             shock_prob=0.005,
         )
-        self.ctx.sources[self.source_name] = sim_source
+        self.ctx = build_default_ctx(extra_adapters=(sim_adapter,))
 
         self.template = SignatureFeaturesTemplate()
 

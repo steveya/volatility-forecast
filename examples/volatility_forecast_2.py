@@ -31,7 +31,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- AlphaForge / Model Imports ---
-from volatility_forecast.sources.simulated_garch import SimulatedGARCHSource
+from volatility_forecast.sources.simulated_garch import SimulatedGARCHAdapter
 from volatility_forecast.pipeline import (
     build_default_ctx,
     build_vol_dataset,
@@ -430,7 +430,27 @@ def process_results(all_metrics, all_alphas, all_preds, y_true, experiment_name)
     print("-" * 60)
 
 
-def run_simulated_study(ctx):
+def _build_sim_ctx(*, run_seed: int, tiingo_cache_backends):
+    return build_default_ctx(
+        tiingo_cache_backends=tiingo_cache_backends,
+        extra_adapters=(
+            SimulatedGARCHAdapter(
+                source_name="simulated_garch",
+                n_periods=SIM_N_PERIODS,
+                random_state=run_seed,
+                mu=0.0,
+                omega=0.02,
+                alpha=0.11,
+                beta=0.87,
+                eta=4.0,
+                shock_prob=0.005,
+                entity_id="SIM",
+            ),
+        ),
+    )
+
+
+def run_simulated_study(*, tiingo_cache_backends):
     logger.info(f"Starting Simulated Study ({N_RUNS} runs)...")
 
     all_metrics = []
@@ -442,21 +462,13 @@ def run_simulated_study(ctx):
     seeds = rng.integers(0, 1_000_000, size=N_RUNS)
 
     for seed in tqdm(seeds, desc="Simulated Runs"):
-        # Regenerate Data with new seed
-        ctx.sources["simulated_garch"] = SimulatedGARCHSource(
-            n_periods=SIM_N_PERIODS,
-            mu=0.0,
-            omega=0.02,
-            alpha=0.11,
-            beta=0.87,
-            eta=4.0,
-            shock_prob=0.005,
-            entity_id="SIM",
+        sim_ctx = _build_sim_ctx(
+            run_seed=int(seed), tiingo_cache_backends=tiingo_cache_backends
         )
         spec = build_dataset_spec(
             "simulated_garch", "SIM", START_DATE, END_DATE, N_LAGS
         )
-        X, y, r, _ = build_wide_dataset(ctx, spec, entity_id="SIM")
+        X, y, r, _ = build_wide_dataset(sim_ctx, spec, entity_id="SIM")
 
         if isinstance(X.index, pd.MultiIndex):
             X = X.droplevel(0)
@@ -592,7 +604,7 @@ def main():
     ctx = build_default_ctx(tiingo_api_key=tiingo_key, tiingo_cache_backends=[cache])
 
     # 1. Simulated
-    run_simulated_study(ctx)
+    run_simulated_study(tiingo_cache_backends=[cache])
 
     # 2. SPY
     if tiingo_key:

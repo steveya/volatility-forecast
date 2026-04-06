@@ -9,6 +9,8 @@ from alphaforge.features.template import ParamSpec, SliceSpec
 from alphaforge.features.frame import FeatureFrame
 from alphaforge.features.ids import make_feature_id, group_path
 
+from volatility_forecast.market_data import load_market_frame
+
 
 class _PriceTemplate:
     # no version here
@@ -36,26 +38,25 @@ class _PriceTemplate:
             params["table"],
             params["price_col"],
         )
-        panel = ctx.fetch_panel(
-            source,
-            Query(
-                table=table,
-                columns=[price_col],
-                start=slice.start,
-                end=slice.end,
-                entities=slice.entities,
-                asof=slice.asof,
-                grid=slice.grid,
-            ),
+        frame = load_market_frame(
+            ctx,
+            dataset=table,
+            columns=[price_col],
+            start=slice.start,
+            end=slice.end,
+            entities=slice.entities,
+            asof=slice.asof,
+            grid=slice.grid,
+            source=source,
         )
-        return panel, table, price_col
+        return frame, table, price_col
 
-    def _logprice(self, panel, price_col: str) -> pd.Series:
-        px = panel.df[price_col].astype(float)
+    def _logprice(self, frame: pd.DataFrame, price_col: str) -> pd.Series:
+        px = frame[price_col].astype(float)
         return np.log(px).groupby(level="entity_id")
 
-    def _logret(self, panel, price_col: str) -> pd.Series:
-        px = panel.df[price_col].astype(float)
+    def _logret(self, frame: pd.DataFrame, price_col: str) -> pd.Series:
+        px = frame[price_col].astype(float)
         return np.log(px).groupby(level="entity_id").diff()
 
 
@@ -71,8 +72,8 @@ class LagLogReturnTemplate(_PriceTemplate):
         self, ctx: DataContext, params: Dict[str, Any], slice: SliceSpec, state
     ):
         lags = int(params["lags"])
-        panel, table, price_col = self._fetch_price_panel(ctx, params, slice)
-        logret = self._logret(panel, price_col)
+        frame, table, price_col = self._fetch_price_panel(ctx, params, slice)
+        logret = self._logret(frame, price_col)
 
         X_cols, cat = {}, []
         # Use k starting at 0 so that shift(k) is explicit: k=0 -> today's return, k=1 -> yesterday, etc.
@@ -92,7 +93,7 @@ class LagLogReturnTemplate(_PriceTemplate):
                 }
             )
 
-        X = pd.DataFrame(X_cols, index=panel.df.index).sort_index()
+        X = pd.DataFrame(X_cols, index=frame.index).sort_index()
         catalog = pd.DataFrame(cat).set_index("feature_id").sort_index()
         return FeatureFrame(
             X=X, catalog=catalog, meta={"template": self.name, "version": self.version}
@@ -117,19 +118,18 @@ class LagAbsLogReturnTemplate(_PriceTemplate):
             params["price_col"],
         )
 
-        panel = ctx.fetch_panel(
-            source,
-            Query(
-                table=table,
-                columns=[price_col],
-                start=slice.start,
-                end=slice.end,
-                entities=slice.entities,
-                asof=slice.asof,
-                grid=slice.grid,
-            ),
+        frame = load_market_frame(
+            ctx,
+            dataset=table,
+            columns=[price_col],
+            start=slice.start,
+            end=slice.end,
+            entities=slice.entities,
+            asof=slice.asof,
+            grid=slice.grid,
+            source=source,
         )
-        px = panel.df[price_col].astype(float)
+        px = frame[price_col].astype(float)
         logret = np.log(px).groupby(level="entity_id").diff().abs()
 
         X_cols = {}
@@ -150,7 +150,7 @@ class LagAbsLogReturnTemplate(_PriceTemplate):
                 }
             )
 
-        X = pd.DataFrame(X_cols, index=panel.df.index).sort_index()
+        X = pd.DataFrame(X_cols, index=frame.index).sort_index()
         catalog = pd.DataFrame(cat).set_index("feature_id").sort_index()
         return FeatureFrame(
             X=X, catalog=catalog, meta={"template": self.name, "version": self.version}
@@ -175,19 +175,18 @@ class LagSquaredLogReturnTemplate(_PriceTemplate):
             params["price_col"],
         )
 
-        panel = ctx.fetch_panel(
-            source,
-            Query(
-                table=table,
-                columns=[price_col],
-                start=slice.start,
-                end=slice.end,
-                entities=slice.entities,
-                asof=slice.asof,
-                grid=slice.grid,
-            ),
+        frame = load_market_frame(
+            ctx,
+            dataset=table,
+            columns=[price_col],
+            start=slice.start,
+            end=slice.end,
+            entities=slice.entities,
+            asof=slice.asof,
+            grid=slice.grid,
+            source=source,
         )
-        px = panel.df[price_col].astype(float)
+        px = frame[price_col].astype(float)
         logret2 = np.log(px).groupby(level="entity_id").diff() ** 2
 
         X_cols = {}
@@ -208,7 +207,7 @@ class LagSquaredLogReturnTemplate(_PriceTemplate):
                 }
             )
 
-        X = pd.DataFrame(X_cols, index=panel.df.index).sort_index()
+        X = pd.DataFrame(X_cols, index=frame.index).sort_index()
         catalog = pd.DataFrame(cat).set_index("feature_id").sort_index()
         return FeatureFrame(
             X=X, catalog=catalog, meta={"template": self.name, "version": self.version}
@@ -237,27 +236,26 @@ class OffsetLogReturnTemplate(_PriceTemplate):
             params["price_col"],
         )
 
-        panel = ctx.fetch_panel(
-            source,
-            Query(
-                table=table,
-                columns=[price_col],
-                start=slice.start,
-                end=slice.end,
-                entities=slice.entities,
-                asof=slice.asof,
-                grid=slice.grid,
-            ),
+        frame = load_market_frame(
+            ctx,
+            dataset=table,
+            columns=[price_col],
+            start=slice.start,
+            end=slice.end,
+            entities=slice.entities,
+            asof=slice.asof,
+            grid=slice.grid,
+            source=source,
         )
 
-        px = panel.df[price_col].astype(float)
+        px = frame[price_col].astype(float)
         lp = np.log(px)
 
         # log P_t - log P_{t-k}
         off = lp.groupby(level="entity_id").diff(k)
 
         fid = make_feature_id(table, "*", "ret", "offset_logret", {"k": k})
-        X = pd.DataFrame({fid: off}, index=panel.df.index).sort_index()
+        X = pd.DataFrame({fid: off}, index=frame.index).sort_index()
         catalog = (
             pd.DataFrame(
                 [

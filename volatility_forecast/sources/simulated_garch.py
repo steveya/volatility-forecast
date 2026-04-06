@@ -12,9 +12,11 @@ from typing import Dict, Optional
 import numpy as np
 import pandas as pd
 
+from alphaforge.data.adapter import SourceAdapterBase
 from alphaforge.data.source import DataSource
 from alphaforge.data.query import Query
 from alphaforge.data.schema import TableSchema
+from alphaforge.data.types import FetchResult
 
 
 CANONICAL_COLUMNS = ["open", "high", "low", "close", "volume"]
@@ -186,3 +188,56 @@ class SimulatedGARCHSource(DataSource):
         df = df[["date", "entity_id"] + cols]
 
         return df.sort_values(["date", "entity_id"]).reset_index(drop=True)
+
+
+@dataclass
+class SimulatedGARCHAdapter(SourceAdapterBase):
+    """Canonical SourceAdapter wrapper for simulated GARCH market data."""
+
+    source_name: str = "simulated_garch"
+    n_periods: int = 2500
+    mu: float = 0.0
+    omega: float = 0.02
+    alpha: float = 0.11
+    beta: float = 0.87
+    eta: float = 4.0
+    shock_prob: float = 0.005
+    random_state: Optional[int] = None
+    start_date: pd.Timestamp = field(
+        default_factory=lambda: pd.Timestamp("2020-01-01", tz="UTC")
+    )
+    entity_id: str = "SIMULATED"
+
+    datasets = frozenset({"market.ohlcv"})
+
+    def __post_init__(self) -> None:
+        self._source = SimulatedGARCHSource(
+            name=self.source_name,
+            n_periods=self.n_periods,
+            mu=self.mu,
+            omega=self.omega,
+            alpha=self.alpha,
+            beta=self.beta,
+            eta=self.eta,
+            shock_prob=self.shock_prob,
+            random_state=self.random_state,
+            start_date=self.start_date,
+            entity_id=self.entity_id,
+        )
+
+    def fetch(self, query: Query, *, max_staleness=None) -> FetchResult:
+        frame = self._source.fetch(query)
+        if frame.empty:
+            data = pd.DataFrame(columns=["series_key", "obs_date", *list(query.columns or [])])
+        else:
+            data = frame.rename(columns={"entity_id": "series_key", "date": "obs_date"})
+        return FetchResult(
+            data=data.reset_index(drop=True),
+            source=self.source_name,
+            dataset=query.table,
+            is_pit=False,
+            cached_at=None,
+        )
+
+    def list_entities(self, dataset: str) -> list[str]:
+        return [self.entity_id]
