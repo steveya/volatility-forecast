@@ -69,7 +69,6 @@ def _log_run_context():
 
 
 # Pipeline
-from alphaforge.data.context import DataContext
 from alphaforge.features.dataset_spec import (
     UniverseSpec,
     TimeSpec,
@@ -108,7 +107,7 @@ from volatility_forecast.reporting.plots import (
     plot_bar_series,
     plot_gate_panel,
 )
-from volatility_forecast.sources.simulated_garch import SimulatedGARCHSource
+from volatility_forecast.sources.simulated_garch import SimulatedGARCHAdapter
 
 
 VARIANTS = [
@@ -152,18 +151,32 @@ SPY_OS_INDEX = 4000
 SPY_N_INITS = 100
 
 
-def _attach_sim_source(ctx: DataContext, run_seed: int) -> None:
-    """Attach a SimulatedGARCHSource to the context."""
-    ctx.sources[SOURCE] = SimulatedGARCHSource(
-        n_periods=2500,
-        random_state=run_seed,
-        mu=0.0,
-        omega=0.02,
-        alpha=0.11,
-        beta=0.87,
-        eta=4.0,
-        shock_prob=0.005,
-        entity_id=ENTITY,
+def _build_sim_ctx(
+    run_seed: int,
+    *,
+    tiingo_api_key: str,
+    tiingo_cache_backends,
+    tiingo_cache_mode: str,
+):
+    """Build an adapter-backed context for one simulated GARCH run."""
+    return build_default_ctx(
+        tiingo_api_key=tiingo_api_key,
+        tiingo_cache_backends=tiingo_cache_backends,
+        tiingo_cache_mode=tiingo_cache_mode,
+        extra_adapters=(
+            SimulatedGARCHAdapter(
+                source_name=SOURCE,
+                n_periods=2500,
+                random_state=run_seed,
+                mu=0.0,
+                omega=0.02,
+                alpha=0.11,
+                beta=0.87,
+                eta=4.0,
+                shock_prob=0.005,
+                entity_id=ENTITY,
+            ),
+        ),
     )
 
 
@@ -1040,11 +1053,12 @@ def main():
     # Base context (for calendars); add simulated source per run
     cache_root = Path(_read_tiingo_cache_dir())
     file_cache = FileCacheBackend(cache_root)
-    ctx = build_default_ctx(
-        tiingo_api_key=_read_tiingo_api_key(),
-        tiingo_cache_backends=[file_cache],
-        tiingo_cache_mode=_read_tiingo_cache_mode(),
-    )
+    ctx_kwargs = {
+        "tiingo_api_key": _read_tiingo_api_key(),
+        "tiingo_cache_backends": [file_cache],
+        "tiingo_cache_mode": _read_tiingo_cache_mode(),
+    }
+    ctx = build_default_ctx(**ctx_kwargs)
 
     rng = np.random.default_rng(42)
     seeds = rng.integers(0, 1_000_000, size=N_RUNS)
@@ -1055,13 +1069,12 @@ def main():
         if i % 10 == 0:
             logger.info(f"  Run {i}/{N_RUNS}")
 
-        # Replace simulated source with run-specific seed
-        _attach_sim_source(ctx, int(seed))
+        sim_ctx = _build_sim_ctx(int(seed), **ctx_kwargs)
 
         # Build wide dataset ONCE for this run
         spec = _build_sim_spec(N_LAGS)
         try:
-            X_wide, y, r, _ = build_wide_dataset(ctx, spec, entity_id=ENTITY)
+            X_wide, y, r, _ = build_wide_dataset(sim_ctx, spec, entity_id=ENTITY)
             if i == 1:
                 # Report IS/OOS date ranges once
                 idx = X_wide.index
@@ -1306,9 +1319,11 @@ def main():
         _ensure_dir(blog_assets_dir)
 
         # Simulated data
-        _attach_sim_source(ctx, 12345)
+        sim_ctx = _build_sim_ctx(12345, **ctx_kwargs)
         spec_sim = _build_sim_spec(N_LAGS)
-        X_sim, y_sim, r_sim, _ = build_wide_dataset(ctx, spec_sim)
+        X_sim, y_sim, r_sim, _ = build_wide_dataset(
+            sim_ctx, spec_sim, entity_id=ENTITY
+        )
         cols_sim = select_variant_columns(X_sim, "STES_EAESE")
         if not cols_sim:
             cols_sim = ["const"]

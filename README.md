@@ -3,6 +3,29 @@ This repository contains the [notebook](https://github.com/steveta/volatility-fo
 
 The repo also contains a package that aims to wrap all the volatility forecasting models into a single package that is compatible with the scikit-learn API. This repo also contains a work-in-progress Flask app that will produce daily volatility forecasts from each model (and new models.) The app package is currently under development and is not ready for use. 
 
+## Development Runtime
+
+This repo now expects the canonical Alphaforge API surface in the `py312`
+conda environment. Install the sibling Alphaforge checkout into that env before
+running tests or examples:
+
+```bash
+conda run -n py312 python -m pip install -e ../alphaforge -e .
+```
+
+Verify that `py312` sees the canonical runtime:
+
+```bash
+conda run -n py312 python -c "from alphaforge.data.context import DataContext; assert hasattr(DataContext, 'from_adapters'); assert hasattr(DataContext, 'load')"
+```
+
+Run tests through the interpreter inside `py312` instead of a bare `pytest`
+shim:
+
+```bash
+conda run -n py312 python -m pytest -q
+```
+
 ## Executive Summary
 
 ### Volatility Forecasts: Part 1 - Baseline Model

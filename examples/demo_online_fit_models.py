@@ -6,12 +6,7 @@ import pandas as pd
 
 from dotenv import load_dotenv
 
-from alphaforge.data.context import DataContext
-from alphaforge.time.calendar import TradingCalendar
-from alphaforge.store.duckdb_parquet import DuckDBParquetStore
-
-from volatility_forecast.sources.tiingo_eod import TiingoEODSource
-from volatility_forecast.pipeline import VolDatasetSpec, build_vol_dataset
+from volatility_forecast.pipeline import VolDatasetSpec, build_default_ctx, build_vol_dataset
 from alphaforge.features.dataset_spec import (
     UniverseSpec,
     TimeSpec,
@@ -45,26 +40,21 @@ def rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 
 def main():
     load_dotenv()
+    feature_lags = 10
 
     api = os.getenv("TIINGO_API")
     if not api:
         raise RuntimeError("Set TIINGO_API env var first (export TIINGO_API=...)")
 
     # --- Alphaforge runtime ---
-    cal = TradingCalendar("XNYS", tz="America/New_York")
-    store = DuckDBParquetStore(
-        root=str("./.af_store")
-    )  # local cache for panels/materializations
-    src = TiingoEODSource(api_key=api)
-
-    ctx = DataContext(sources={"tiingo": src}, calendars={"XNYS": cal}, store=store)
+    ctx = build_default_ctx(tiingo_api_key=api, store_root="./.af_store")
 
     # --- Experiment spec (new scalable API) ---
     features = (
         FeatureRequest(
             template=LagLogReturnTemplate(),
             params={
-                "lags": 10,
+                "lags": feature_lags,
                 "source": "tiingo",
                 "table": "market.ohlcv",
                 "price_col": "close",
@@ -73,7 +63,7 @@ def main():
         FeatureRequest(
             template=LagAbsLogReturnTemplate(),
             params={
-                "lags": 10,
+                "lags": feature_lags,
                 "source": "tiingo",
                 "table": "market.ohlcv",
                 "price_col": "close",
@@ -82,7 +72,7 @@ def main():
         FeatureRequest(
             template=LagSquaredLogReturnTemplate(),
             params={
-                "lags": 10,
+                "lags": feature_lags,
                 "source": "tiingo",
                 "table": "market.ohlcv",
                 "price_col": "close",
@@ -136,7 +126,7 @@ def main():
     y_tr, y_te = y.iloc[:split], y.iloc[split:]
     r_tr, r_te = r.iloc[:split], r.iloc[split:]
 
-    burn = min(spec.lags, max(1, len(X_tr) // 20))
+    burn = min(feature_lags, max(1, len(X_tr) // 20))
 
     print(f"Built dataset: X={X.shape}, y={y.shape}, returns={r.shape}")
     print(f"Train={len(X_tr)}, Test={len(X_te)}, burn={burn}")

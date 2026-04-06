@@ -9,6 +9,8 @@ from alphaforge.features.template import ParamSpec, SliceSpec
 from alphaforge.features.frame import FeatureFrame
 from alphaforge.features.ids import make_feature_id, group_path
 
+from volatility_forecast.market_data import load_market_frame
+
 
 class HighLowRangeTemplate:
     version = "1.0"
@@ -36,21 +38,20 @@ class HighLowRangeTemplate:
         high_col, low_col = params["high_col"], params["low_col"]
         include_parkinson = str(params["include_parkinson"]).lower() == "yes"
 
-        panel = ctx.fetch_panel(
-            source,
-            Query(
-                table=table,
-                columns=[high_col, low_col],
-                start=slice.start,
-                end=slice.end,
-                entities=slice.entities,
-                asof=slice.asof,
-                grid=slice.grid,
-            ),
+        frame = load_market_frame(
+            ctx,
+            dataset=table,
+            columns=[high_col, low_col],
+            start=slice.start,
+            end=slice.end,
+            entities=slice.entities,
+            asof=slice.asof,
+            grid=slice.grid,
+            source=source,
         )
 
-        hi = panel.df[high_col].astype(float)
-        lo = panel.df[low_col].astype(float)
+        hi = frame[high_col].astype(float)
+        lo = frame[low_col].astype(float)
 
         hl = np.log(hi) - np.log(lo)
 
@@ -84,7 +85,7 @@ class HighLowRangeTemplate:
                 }
             )
 
-        X = pd.DataFrame(X_cols, index=panel.df.index).sort_index()
+        X = pd.DataFrame(X_cols, index=frame.index).sort_index()
         catalog = pd.DataFrame(cat).set_index("feature_id").sort_index()
         return FeatureFrame(
             X=X, catalog=catalog, meta={"template": self.name, "version": self.version}

@@ -1,19 +1,20 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 from alphaforge.data.cache import CacheBackend
 from alphaforge.data.context import DataContext
-from alphaforge.data.query import Query
 from alphaforge.features.dataset_builder import build_dataset
 
 # New scalable dataset API
 from alphaforge.features.dataset_spec import (
     DatasetSpec,
     FeatureRequest,
+    FeatureRequestGroup,
     JoinPolicy,
     MissingnessPolicy,
     TargetRequest,
@@ -22,6 +23,7 @@ from alphaforge.features.dataset_spec import (
 )
 from alphaforge.store.raw_data_store import RawDataStore
 
+from .market_data import load_market_frame
 from .sources.tiingo_eod import TiingoEODSource
 
 
@@ -40,7 +42,7 @@ class VolDatasetSpec:
     time: TimeSpec
 
     # requests
-    features: Tuple[FeatureRequest, ...] = field(default_factory=tuple)
+    features: Tuple[FeatureRequest | FeatureRequestGroup, ...] = field(default_factory=tuple)
     target: TargetRequest | None = None  # type: ignore
 
     # policies
@@ -56,42 +58,43 @@ def build_default_ctx(
     tiingo_cache_backends: Optional[Sequence[CacheBackend]] = None,
     tiingo_cache_mode: Optional[str] = None,
     tiingo_raw_store: Optional[RawDataStore] = None,
+    store_root: str = ".af_store",
+    extra_adapters: Optional[Sequence[Any]] = None,
+    extra_sources: Optional[Mapping[str, Any]] = None,
 ) -> DataContext:
     """Construct a default Alphaforge DataContext for the vol domain.
 
     Uses:
-    - TiingoEODSource for daily adjusted OHLCV (legacy ``sources`` path)
-    - TiingoAdapter for unified ``ctx.fetch()`` path
-    - LocalParquetStore for caching materializations
+    - adapter-backed `DataContext.from_adapters(...)` as the canonical path
+    - legacy `sources` wiring only as a temporary compatibility surface
+    - DuckDBParquetStore for caching materializations
     """
-    import os
-
     from alphaforge.data.sources.tiingo import TiingoAdapter
     from alphaforge.store.duckdb_parquet import DuckDBParquetStore
     from alphaforge.time.calendar import TradingCalendar
 
+    api_key = tiingo_api_key or os.environ.get("TIINGO_API_KEY") or os.environ.get("TIINGO_API")
     cal = TradingCalendar("XNYS", tz="UTC")
     src = TiingoEODSource(
-        api_key=tiingo_api_key,
+        api_key=api_key,
         cache_backends=tiingo_cache_backends or (),
         cache_mode=tiingo_cache_mode or "use",
         raw_store=tiingo_raw_store,
     )
-    store = DuckDBParquetStore(root=".af_store")
+    store = DuckDBParquetStore(root=store_root)
 
-    # Resolve Tiingo API key for the unified adapter
-    api_key = tiingo_api_key or os.environ.get("TIINGO_API_KEY", "")
-    tiingo_adapter = TiingoAdapter(api_key=api_key)
-
-    return DataContext(
-        sources={"tiingo": src},
+    tiingo_adapter = TiingoAdapter(api_key=api_key or "", cache_conn=store.conn())
+    adapters = [tiingo_adapter, *(extra_adapters or ())]
+    ctx = DataContext.from_adapters(
+        *adapters,
         calendars={"XNYS": cal},
         store=store,
-        universe=None,
-        entity_meta=None,
-        adapters={"tiingo": tiingo_adapter},
-        default_sources={"market.ohlcv": "tiingo"},
     )
+
+    legacy_sources = {"tiingo": src}
+    legacy_sources.update(dict(extra_sources or {}))
+    ctx.sources = legacy_sources
+    return ctx
 
 
 def build_vol_dataset(
@@ -133,17 +136,18 @@ def build_vol_dataset(
     table = tgt_params.get("table", "market.ohlcv")
     price_col = tgt_params.get("price_col", "close")
 
-    q = Query(
-        table=table,
+    frame = load_market_frame(
+        ctx,
+        dataset=table,
         columns=[price_col],
         start=spec.time.start,
         end=spec.time.end,
         entities=list(spec.universe.entities),
         asof=spec.time.asof,
         grid=spec.time.grid,
+        source=source,
     )
-    panel = ctx.fetch_panel(source, q)
-    px = panel.df[price_col].astype(float)
+    px = frame[price_col].astype(float)
     ret = np.log(px).groupby(level="entity_id").diff().rename("logret")
 
     # Align returns to the final dataset index, then drop any rows with NaNs across all

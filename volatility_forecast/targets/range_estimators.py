@@ -10,6 +10,7 @@ try:
     from alphaforge.features.template import ParamSpec, SliceSpec
     from alphaforge.features.frame import FeatureFrame
     from alphaforge.features.ids import make_feature_id, group_path
+    from volatility_forecast.market_data import load_market_frame
 except ImportError:
     DataContext = object  # type: ignore[misc,assignment]
 
@@ -32,6 +33,9 @@ except ImportError:
 
     def group_path(*args: Any, **kwargs: Any) -> str:  # type: ignore[misc]
         return ""
+
+    def load_market_frame(*args: Any, **kwargs: Any) -> pd.DataFrame:  # type: ignore[misc]
+        return pd.DataFrame()
 
 
 class ParkinsonTarget:
@@ -56,26 +60,25 @@ class ParkinsonTarget:
     ):
         source, table = params["source"], params["table"]
         scale = float(params.get("scale", 1.0))
-        panel = ctx.fetch_panel(
-            source,
-            Query(
-                table=table,
-                columns=["high", "low"],
-                start=slice.start,
-                end=slice.end,
-                entities=slice.entities,
-                asof=slice.asof,
-                grid=slice.grid,
-            ),
+        frame = load_market_frame(
+            ctx,
+            dataset=table,
+            columns=["high", "low"],
+            start=slice.start,
+            end=slice.end,
+            entities=slice.entities,
+            asof=slice.asof,
+            grid=slice.grid,
+            source=source,
         )
-        hi = panel.df["high"].astype(float)
-        lo = panel.df["low"].astype(float)
+        hi = frame["high"].astype(float)
+        lo = frame["low"].astype(float)
         loghl = np.log(hi / lo)
         # Parkinson estimator (single-day)
         y = compute_parkinson_from_loghl(loghl) * scale
 
         fid = make_feature_id(table, "*", "target", "parkinson", {"scale": scale})
-        X = pd.DataFrame({fid: y}, index=panel.df.index).sort_index()
+        X = pd.DataFrame({fid: y}, index=frame.index).sort_index()
         catalog = pd.DataFrame(
             [
                 {
@@ -115,28 +118,27 @@ class GarmanKlassTarget:
     ):
         source, table = params["source"], params["table"]
         scale = float(params.get("scale", 1.0))
-        panel = ctx.fetch_panel(
-            source,
-            Query(
-                table=table,
-                columns=["open", "high", "low", "close"],
-                start=slice.start,
-                end=slice.end,
-                entities=slice.entities,
-                asof=slice.asof,
-                grid=slice.grid,
-            ),
+        frame = load_market_frame(
+            ctx,
+            dataset=table,
+            columns=["open", "high", "low", "close"],
+            start=slice.start,
+            end=slice.end,
+            entities=slice.entities,
+            asof=slice.asof,
+            grid=slice.grid,
+            source=source,
         )
-        o = panel.df["open"].astype(float)
-        hi = panel.df["high"].astype(float)
-        lo = panel.df["low"].astype(float)
-        c = panel.df["close"].astype(float)
+        o = frame["open"].astype(float)
+        hi = frame["high"].astype(float)
+        lo = frame["low"].astype(float)
+        c = frame["close"].astype(float)
         log_hl = np.log(hi / lo)
         log_co = np.log(c / o)
         y = compute_garman_klass_from_logs(log_hl, log_co) * scale
 
         fid = make_feature_id(table, "*", "target", "garman_klass", {"scale": scale})
-        X = pd.DataFrame({fid: y}, index=panel.df.index).sort_index()
+        X = pd.DataFrame({fid: y}, index=frame.index).sort_index()
         catalog = pd.DataFrame(
             [
                 {
@@ -185,22 +187,21 @@ class YangZhangTarget:
     ):
         source, table = params["source"], params["table"]
         scale = float(params.get("scale", 1.0))
-        panel = ctx.fetch_panel(
-            source,
-            Query(
-                table=table,
-                columns=["open", "high", "low", "close"],
-                start=slice.start,
-                end=slice.end,
-                entities=slice.entities,
-                asof=slice.asof,
-                grid=slice.grid,
-            ),
+        frame = load_market_frame(
+            ctx,
+            dataset=table,
+            columns=["open", "high", "low", "close"],
+            start=slice.start,
+            end=slice.end,
+            entities=slice.entities,
+            asof=slice.asof,
+            grid=slice.grid,
+            source=source,
         )
-        o = panel.df["open"].astype(float)
-        hi = panel.df["high"].astype(float)
-        lo = panel.df["low"].astype(float)
-        c = panel.df["close"].astype(float)
+        o = frame["open"].astype(float)
+        hi = frame["high"].astype(float)
+        lo = frame["low"].astype(float)
+        c = frame["close"].astype(float)
         # compute required logs
         log_co = np.log(c / o)
         log_hl = np.log(hi / lo)
@@ -210,7 +211,7 @@ class YangZhangTarget:
 
         y = compute_yang_zhang_from_logs(log_oo, log_co, log_hl) * scale
         fid = make_feature_id(table, "*", "target", "yang_zhang", {"scale": scale})
-        X = pd.DataFrame({fid: y}, index=panel.df.index).sort_index()
+        X = pd.DataFrame({fid: y}, index=frame.index).sort_index()
         catalog = pd.DataFrame(
             [
                 {
@@ -260,19 +261,18 @@ class IntradayRealizedVarianceTarget:
             params["price_col"],
         )
         scale = float(params.get("scale", 1.0))
-        panel = ctx.fetch_panel(
-            source,
-            Query(
-                table=table,
-                columns=[price_col],
-                start=slice.start,
-                end=slice.end,
-                entities=slice.entities,
-                asof=slice.asof,
-                grid=slice.grid,
-            ),
+        frame = load_market_frame(
+            ctx,
+            dataset=table,
+            columns=[price_col],
+            start=slice.start,
+            end=slice.end,
+            entities=slice.entities,
+            asof=slice.asof,
+            grid=slice.grid,
+            source=source,
         )
-        df = panel.df.reset_index()
+        df = frame.reset_index()
         # detect a datetime column (supports timezone-aware dtypes)
         # Detect a datetime column (supports timezone-aware dtypes)
         # Avoid deprecated pandas API `is_datetime64tz_dtype` by checking the dtype class.
