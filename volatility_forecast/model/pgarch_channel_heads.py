@@ -7,7 +7,7 @@ from typing import Any
 
 import numpy as np
 
-from .pgarch_core import VALID_PGARCH_CHANNELS
+from .components.channel_layout import VALID_PGARCH_CHANNELS
 
 CHANNEL_XGB_PARAM_MAP = {
     "booster": "booster",
