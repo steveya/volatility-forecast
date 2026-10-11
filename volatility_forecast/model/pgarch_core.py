@@ -7,9 +7,27 @@ from typing import Sequence
 
 import numpy as np
 
-from .xgb_pgarch_model import _logit, _sigmoid, _softplus, _softplus_inverse
-
-VALID_PGARCH_CHANNELS = ("mu", "phi", "g")
+from .components.channel_layout import VALID_PGARCH_CHANNELS as VALID_PGARCH_CHANNELS
+from .components.constraints import (
+    logit as _logit,
+)
+from .components.constraints import (
+    sigmoid as _sigmoid,
+)
+from .components.constraints import (
+    softplus as _softplus,
+)
+from .components.constraints import (
+    softplus_inverse as _softplus_inverse,
+)
+from .components.losses import (
+    loss_from_variance,
+    loss_grad_wrt_h,
+    loss_hess_weight_wrt_h,
+    optimization_loss_name,
+    score_from_variance,
+)
+from .components.recursion import pgarch_step, variance_path_from_components
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,7 +132,7 @@ class PGARCHCore:
 
     @property
     def optimization_loss_name(self) -> str:
-        return "mse" if self.loss == "rmse" else self.loss
+        return optimization_loss_name(self.loss)
 
     def link_mu(self, a: np.ndarray) -> np.ndarray:
         return self.bounds.mu_min + np.asarray(_softplus(np.asarray(a, dtype=float)), dtype=float)
@@ -191,22 +209,24 @@ class PGARCHCore:
         floor_active = np.zeros(T, dtype=bool)
 
         for row in range(T - 1):
-            q[row] = g[row] * y_np[row] + (1.0 - g[row]) * h[row]
-            h_raw_next = (1.0 - phi[row]) * mu[row] + phi[row] * q[row]
-            if h_raw_next <= self.bounds.h_min:
-                h[row + 1] = self.bounds.h_min
-                rho[row] = 0.0
-                local_impulse_mu[row] = 0.0
-                local_impulse_phi[row] = 0.0
-                local_impulse_g[row] = 0.0
-                floor_active[row] = True
-                continue
-
-            h[row + 1] = h_raw_next
-            rho[row] = phi[row] * (1.0 - g[row])
-            local_impulse_mu[row] = (1.0 - phi[row]) * mu_prime[row]
-            local_impulse_phi[row] = (q[row] - mu[row]) * phi_prime[row]
-            local_impulse_g[row] = phi[row] * (y_np[row] - h[row]) * g_prime[row]
+            step = pgarch_step(
+                mu=float(mu[row]),
+                phi=float(phi[row]),
+                g=float(g[row]),
+                y_prev=float(y_np[row]),
+                h_prev=float(h[row]),
+                h_min=self.bounds.h_min,
+                mu_prime=float(mu_prime[row]),
+                phi_prime=float(phi_prime[row]),
+                g_prime=float(g_prime[row]),
+            )
+            q[row] = step.q
+            h[row + 1] = step.h_next
+            rho[row] = step.rho
+            local_impulse_mu[row] = step.local_impulse_mu
+            local_impulse_phi[row] = step.local_impulse_phi
+            local_impulse_g[row] = step.local_impulse_g
+            floor_active[row] = step.floor_active
 
         q[-1] = g[-1] * y_np[-1] + (1.0 - g[-1]) * h[-1]
         return PGARCHRecursionState(
@@ -235,60 +255,26 @@ class PGARCHCore:
         g: np.ndarray,
         h0: float,
     ) -> np.ndarray:
-        y_np = np.asarray(y, dtype=float)
-        mu_np = np.asarray(mu, dtype=float)
-        phi_np = np.asarray(phi, dtype=float)
-        g_np = np.asarray(g, dtype=float)
-        T = len(y_np)
-        for name, arr in {"mu": mu_np, "phi": phi_np, "g": g_np}.items():
-            if arr.shape != (T,):
-                raise ValueError(f"{name} must have shape {(T,)}, got {arr.shape}.")
-
-        h = np.empty(T, dtype=float)
-        h[0] = max(float(h0), self.bounds.h_min)
-        for row in range(T - 1):
-            q_row = g_np[row] * y_np[row] + (1.0 - g_np[row]) * h[row]
-            h[row + 1] = max((1.0 - phi_np[row]) * mu_np[row] + phi_np[row] * q_row, self.bounds.h_min)
-        return h
+        return variance_path_from_components(
+            y,
+            mu=mu,
+            phi=phi,
+            g=g,
+            h0=h0,
+            h_min=self.bounds.h_min,
+        )
 
     def loss_from_variance(self, y: np.ndarray, h: np.ndarray) -> float:
-        return self.score_from_variance(y, h, metric=self.optimization_loss_name)
+        return loss_from_variance(y, h, loss=self.loss, h_min=self.bounds.h_min)
 
     def loss_grad_wrt_h(self, y: np.ndarray, h: np.ndarray) -> np.ndarray:
-        y_np = np.asarray(y, dtype=float)
-        h_safe = np.maximum(np.asarray(h, dtype=float), self.bounds.h_min)
-        grad = np.zeros_like(h_safe)
-        n_eff = float(len(y_np) - 1)
-        if self.optimization_loss_name == "mse":
-            grad[1:] = 2.0 * (h_safe[1:] - y_np[1:]) / n_eff
-            return grad
-        grad[1:] = (1.0 / h_safe[1:] - y_np[1:] / (h_safe[1:] ** 2)) / n_eff
-        return grad
+        return loss_grad_wrt_h(y, h, loss=self.loss, h_min=self.bounds.h_min)
 
     def loss_hess_weight_wrt_h(self, y: np.ndarray, h: np.ndarray) -> np.ndarray:
-        y_np = np.asarray(y, dtype=float)
-        h_safe = np.maximum(np.asarray(h, dtype=float), self.bounds.h_min)
-        weight = np.zeros_like(h_safe)
-        n_eff = float(len(y_np) - 1)
-        if self.optimization_loss_name == "mse":
-            weight[1:] = 2.0 / n_eff
-            return weight
-        weight[1:] = 1.0 / (n_eff * (h_safe[1:] ** 2))
-        weight[1:] = np.clip(weight[1:], 1e-12, 1e12)
-        return weight
+        return loss_hess_weight_wrt_h(y, h, loss=self.loss, h_min=self.bounds.h_min)
 
     def score_from_variance(self, y: np.ndarray, h: np.ndarray, metric: str) -> float:
-        y_np = np.asarray(y, dtype=float)
-        h_safe = np.maximum(np.asarray(h, dtype=float), self.bounds.h_min)
-        y_eff = y_np[1:]
-        h_eff = h_safe[1:]
-        if metric == "mse":
-            return float(np.mean((y_eff - h_eff) ** 2))
-        if metric == "rmse":
-            return float(np.sqrt(np.mean((y_eff - h_eff) ** 2)))
-        if metric == "qlike":
-            return float(np.mean(np.log(h_eff) + y_eff / h_eff))
-        raise ValueError(f"metric must be one of ['mse', 'rmse', 'qlike'], got {metric!r}.")
+        return score_from_variance(y, h, metric=metric, h_min=self.bounds.h_min)
 
 
 def blend_raw_scores(

@@ -26,6 +26,20 @@ shim:
 conda run -n py312 python -m pytest -q
 ```
 
+## Shared PGARCH Components
+
+`volatility_forecast/model/components/` owns the constrained score links,
+intercept-aware channel routing, causal variance recursion, and loss geometry
+used by the linear and XGBoost PGARCH models.
+
+Channel feature lists must contain integer column indices; empty lists select
+only the intercept. Fractional, string, and boolean indices are rejected rather
+than silently converted. Shared loss helpers require matching, finite 1-D
+target and variance arrays with at least two observations and a finite positive
+`h_min`. Scoring and derivatives exclude the first observation, which is the
+fixed warm-start state. `rmse` training uses MSE while RMSE scoring remains
+available.
+
 ## Executive Summary
 
 ### Volatility Forecasts: Part 1 - Baseline Model

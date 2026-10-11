@@ -11,6 +11,19 @@ from typing import Any
 import numpy as np
 from scipy.optimize import minimize
 
+from .components.constraints import (
+    logit as _logit,
+)
+from .components.constraints import (
+    sigmoid as _sigmoid,
+)
+from .components.constraints import (
+    softplus as _softplus,
+)
+from .components.constraints import (
+    softplus_inverse as _softplus_inverse,
+)
+
 try:
     import xgboost as xgb
 except Exception:  # pragma: no cover - optional dependency
@@ -22,44 +35,6 @@ except Exception:  # pragma: no cover - optional dependency / branch skew
     PGARCHLinearModel = None  # type: ignore
 
 logger = logging.getLogger(__name__)
-
-
-def _sigmoid(z: np.ndarray | float) -> np.ndarray | float:
-    z_arr = np.asarray(z, dtype=float)
-    out = np.empty_like(z_arr, dtype=float)
-    pos = z_arr >= 0.0
-    out[pos] = 1.0 / (1.0 + np.exp(-z_arr[pos]))
-    exp_z = np.exp(z_arr[~pos])
-    out[~pos] = exp_z / (1.0 + exp_z)
-    if np.isscalar(z):
-        return float(out)
-    return out
-
-
-def _softplus(z: np.ndarray | float) -> np.ndarray | float:
-    z_arr = np.asarray(z, dtype=float)
-    out = np.log1p(np.exp(-np.abs(z_arr))) + np.maximum(z_arr, 0.0)
-    if np.isscalar(z):
-        return float(out)
-    return out
-
-
-def _softplus_inverse(y: np.ndarray | float, eps: float = 1e-12) -> np.ndarray | float:
-    y_arr = np.asarray(y, dtype=float)
-    y_arr = np.maximum(y_arr, eps)
-    out = y_arr + np.log(-np.expm1(-y_arr))
-    if np.isscalar(y):
-        return float(out)
-    return out
-
-
-def _logit(p: np.ndarray | float, eps: float = 1e-12) -> np.ndarray | float:
-    p_arr = np.asarray(p, dtype=float)
-    p_arr = np.clip(p_arr, eps, 1.0 - eps)
-    out = np.log(p_arr) - np.log1p(-p_arr)
-    if np.isscalar(p):
-        return float(out)
-    return out
 
 
 def _coerce_X(X: Any) -> tuple[np.ndarray, list[str] | None]:

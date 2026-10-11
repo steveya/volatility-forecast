@@ -7,57 +7,54 @@ from typing import Any
 import numpy as np
 from scipy.optimize import OptimizeResult, minimize
 
-
-def _sigmoid(z: np.ndarray | float) -> np.ndarray | float:
-    z_arr = np.asarray(z, dtype=float)
-    out = np.empty_like(z_arr, dtype=float)
-    pos = z_arr >= 0.0
-    out[pos] = 1.0 / (1.0 + np.exp(-z_arr[pos]))
-    exp_z = np.exp(z_arr[~pos])
-    out[~pos] = exp_z / (1.0 + exp_z)
-    if np.isscalar(z):
-        return float(out)
-    return out
-
-
-def _softplus(z: np.ndarray | float) -> np.ndarray | float:
-    z_arr = np.asarray(z, dtype=float)
-    out = np.log1p(np.exp(-np.abs(z_arr))) + np.maximum(z_arr, 0.0)
-    if np.isscalar(z):
-        return float(out)
-    return out
-
-
-def _logit(p: np.ndarray | float, eps: float = 1e-12) -> np.ndarray | float:
-    p_arr = np.asarray(p, dtype=float)
-    p_arr = np.clip(p_arr, eps, 1.0 - eps)
-    out = np.log(p_arr) - np.log1p(-p_arr)
-    if np.isscalar(p):
-        return float(out)
-    return out
-
-
-def _softplus_inverse(y: np.ndarray | float, eps: float = 1e-12) -> np.ndarray | float:
-    y_arr = np.asarray(y, dtype=float)
-    y_arr = np.maximum(y_arr, eps)
-    out = y_arr + np.log(-np.expm1(-y_arr))
-    if np.isscalar(y):
-        return float(out)
-    return out
+from .components.channel_layout import ChannelLayout, build_channel_layout
+from .components.constraints import (
+    logit as _logit,
+)
+from .components.constraints import (
+    sigmoid as _sigmoid,
+)
+from .components.constraints import (
+    softplus as _softplus,
+)
+from .components.constraints import (
+    softplus_inverse as _softplus_inverse,
+)
+from .components.losses import (
+    loss_from_variance,
+    loss_grad_wrt_h,
+    loss_hess_wrt_h,
+    optimization_loss_name,
+    score_from_variance,
+)
+from .components.recursion import pgarch_step
 
 
 class PGARCHLinearModel:
-    """Linear Predictive GARCH model with analytic derivatives.
+    r"""Linear Predictive GARCH model with analytic derivatives.
 
-    Notes
-    -----
-    ``predict_components(X)`` returns component values associated with each
-    feature row ``X[t]``. The recursive variance path instead uses ``X[t-1]``
-    together with ``y[t-1]`` to forecast ``h[t]``.
+    The model follows the causal recursion
 
-    The initial state ``h[0]`` is treated as a fixed causal warm start using
-    ``max(y[0], h_min)``. Losses, gradients, Hessians, and scores therefore
-    exclude ``t = 0`` and are computed only on ``t = 1, ..., T-1``.
+    .. math::
+
+        h_t = (1 - \phi_t)\mu_t + \phi_t\left[g_t y_{t-1} + (1-g_t) h_{t-1}\right]
+
+    with channel-specific linear scores mapped through constrained links:
+
+    .. math::
+
+        \mu_t = \mu_{\min} + \operatorname{softplus}(a_t),
+        \qquad
+        \phi_t = \phi_{\min} + (\phi_{\max} - \phi_{\min})\sigma(b_t),
+        \qquad
+        g_t = g_{\min} + (g_{\max} - g_{\min})\sigma(c_t)
+
+    ``channel_features`` controls which feature columns are visible to each
+    channel; every channel always includes an intercept. ``predict_components``
+    returns rowwise ``mu``, ``phi``, and ``g`` aligned to ``X[t]``, while the
+    recursive variance path uses ``X[t-1]`` and ``y[t-1]`` to form ``h[t]``.
+    The warm start is fixed at ``h[0] = max(y[0], h_min)``, so losses and
+    analytic derivatives exclude ``t = 0``.
     """
 
     def __init__(
@@ -129,6 +126,7 @@ class PGARCHLinearModel:
         self.random_state = random_state
         self.channel_features = channel_features
 
+        self._channel_layout_: ChannelLayout | None = None
         # Per-channel layout (set during fit)
         self._mu_aug_cols_: np.ndarray | None = None
         self._phi_aug_cols_: np.ndarray | None = None
@@ -246,14 +244,7 @@ class PGARCHLinearModel:
             raise ValueError(f"metric must be one of {sorted(valid_metrics)}")
         y_np, X_np = self._validate_inputs(y, X)
         h = self.predict_variance(y_np, X_np)
-        y_eff = y_np[1:]
-        h_eff = h[1:]
-        if metric == "mse":
-            return float(np.mean((y_eff - h_eff) ** 2))
-        if metric == "rmse":
-            return float(np.sqrt(np.mean((y_eff - h_eff) ** 2)))
-        h_safe = np.maximum(h_eff, self.h_min)
-        return float(np.mean(np.log(h_safe) + y_eff / h_safe))
+        return score_from_variance(y_np, h, metric=metric, h_min=self.h_min)
 
     def _setup_channel_layout(self, n_features: int) -> None:
         """Compute per-channel X_aug column indices and parameter counts.
@@ -262,39 +253,14 @@ class PGARCHLinearModel:
         (backward-compatible).  Otherwise each channel sees only its own
         feature columns plus the intercept (column 0 in X_aug).
         """
-        if self.channel_features is None:
-            all_aug = np.arange(1 + n_features)
-            self._mu_aug_cols_ = all_aug
-            self._phi_aug_cols_ = all_aug
-            self._g_aug_cols_ = all_aug
-        else:
-            for ch in ("mu", "phi", "g"):
-                if ch not in self.channel_features:
-                    raise ValueError(
-                        f"channel_features must contain key '{ch}'."
-                    )
-                idx = np.asarray(self.channel_features[ch], dtype=int)
-                if idx.ndim != 1:
-                    raise ValueError(
-                        f"channel_features['{ch}'] must be a 1-D sequence of column indices."
-                    )
-                if len(idx) > 0 and (idx.min() < 0 or idx.max() >= n_features):
-                    raise ValueError(
-                        f"channel_features['{ch}'] indices must be in [0, {n_features})."
-                    )
-            self._mu_aug_cols_ = np.concatenate(
-                [[0], np.asarray(self.channel_features["mu"], dtype=int) + 1]
-            )
-            self._phi_aug_cols_ = np.concatenate(
-                [[0], np.asarray(self.channel_features["phi"], dtype=int) + 1]
-            )
-            self._g_aug_cols_ = np.concatenate(
-                [[0], np.asarray(self.channel_features["g"], dtype=int) + 1]
-            )
-
-        self._n_mu_ = len(self._mu_aug_cols_)
-        self._n_phi_ = len(self._phi_aug_cols_)
-        self._n_g_ = len(self._g_aug_cols_)
+        layout = build_channel_layout(n_features, self.channel_features)
+        self._channel_layout_ = layout
+        self._mu_aug_cols_ = layout.mu_aug_cols
+        self._phi_aug_cols_ = layout.phi_aug_cols
+        self._g_aug_cols_ = layout.g_aug_cols
+        self._n_mu_ = layout.n_mu
+        self._n_phi_ = layout.n_phi
+        self._n_g_ = layout.n_g
 
     def _validate_inputs(self, y: np.ndarray, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         y_np = np.asarray(y, dtype=float)
@@ -439,9 +405,13 @@ class PGARCHLinearModel:
         phi_slice = slice(n_mu, n_mu + n_phi)
         g_slice = slice(n_mu + n_phi, total_params)
 
-        mu_cols = self._mu_aug_cols_
-        phi_cols = self._phi_aug_cols_
-        g_cols = self._g_aug_cols_
+        layout = self._channel_layout_
+        if layout is None:
+            raise ValueError("Channel layout is not initialized.")
+
+        mu_cols = layout.mu_aug_cols
+        phi_cols = layout.phi_aug_cols
+        g_cols = layout.g_aug_cols
 
         phi_span = self.phi_max - self.phi_min
         g_span = self.g_max - self.g_min
@@ -486,7 +456,15 @@ class PGARCHLinearModel:
 
             y_prev = y_np[t - 1]
             h_prev = h[t - 1]
-            q_t = g_t * y_prev + (1.0 - g_t) * h_prev
+            step = pgarch_step(
+                mu=mu_t,
+                phi=phi_t,
+                g=g_t,
+                y_prev=y_prev,
+                h_prev=h_prev,
+                h_min=self.h_min,
+            )
+            q_t = step.q
 
             if compute_grad:
                 J_mu_t = np.zeros(total_params, dtype=float)
@@ -548,8 +526,7 @@ class PGARCHLinearModel:
                         + np.outer(J_q_t - J_mu_t, J_phi_t)
                     )
 
-            h_raw_t = (1.0 - phi_t) * mu_t + phi_t * q_t
-            if h_raw_t <= self.h_min:
+            if step.floor_active:
                 # The clipped state is locally constant with respect to the
                 # model parameters, so both first- and second-order
                 # sensitivities are zero through this transition.
@@ -559,7 +536,7 @@ class PGARCHLinearModel:
                 if compute_hess:
                     H[t] = 0.0
             else:
-                h[t] = h_raw_t
+                h[t] = step.h_next
                 if compute_grad:
                     J[t] = J_raw_t
                 if compute_hess:
@@ -636,47 +613,25 @@ class PGARCHLinearModel:
         y: np.ndarray,
         h: np.ndarray,
     ) -> float:
-        y_np = np.asarray(y, dtype=float)
-        h_safe = np.maximum(np.asarray(h, dtype=float), self.h_min)
-        y_eff = y_np[1:]
-        h_eff = h_safe[1:]
-        if self._optimization_loss_name == "mse":
-            return float(np.mean((y_eff - h_eff) ** 2))
-        return float(np.mean(np.log(h_eff) + y_eff / h_eff))
+        return loss_from_variance(y, h, loss=self.loss, h_min=self.h_min)
 
     def _loss_grad_wrt_h(
         self,
         y: np.ndarray,
         h: np.ndarray,
     ) -> np.ndarray:
-        y_np = np.asarray(y, dtype=float)
-        h_safe = np.maximum(np.asarray(h, dtype=float), self.h_min)
-        grad = np.zeros_like(h_safe)
-        n_eff = float(len(y_np) - 1)
-        if self._optimization_loss_name == "mse":
-            grad[1:] = 2.0 * (h_safe[1:] - y_np[1:]) / n_eff
-            return grad
-        grad[1:] = (1.0 / h_safe[1:] - y_np[1:] / (h_safe[1:] ** 2)) / n_eff
-        return grad
+        return loss_grad_wrt_h(y, h, loss=self.loss, h_min=self.h_min)
 
     def _loss_hess_wrt_h(
         self,
         y: np.ndarray,
         h: np.ndarray,
     ) -> np.ndarray:
-        y_np = np.asarray(y, dtype=float)
-        h_safe = np.maximum(np.asarray(h, dtype=float), self.h_min)
-        hess = np.zeros_like(h_safe)
-        n_eff = float(len(y_np) - 1)
-        if self._optimization_loss_name == "mse":
-            hess[1:] = 2.0 / n_eff
-            return hess
-        hess[1:] = (-1.0 / (h_safe[1:] ** 2) + 2.0 * y_np[1:] / (h_safe[1:] ** 3)) / n_eff
-        return hess
+        return loss_hess_wrt_h(y, h, loss=self.loss, h_min=self.h_min)
 
     @property
     def _optimization_loss_name(self) -> str:
-        return "mse" if self.loss == "rmse" else self.loss
+        return optimization_loss_name(self.loss)
 
     def _check_is_fitted(self) -> None:
         if not self.is_fitted_ or self.theta_ is None:
