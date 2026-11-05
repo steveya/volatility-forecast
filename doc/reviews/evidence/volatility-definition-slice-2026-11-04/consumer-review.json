@@ -1,0 +1,46 @@
+{
+  "store": "/Users/steveyang/Projects/steveya/volatility-forecast/.synapse/knowledge.sqlite",
+  "snapshot": {
+    "store_id": "8e240fd4-5148-4406-8a52-d7d638ffb6d6",
+    "revision": 12
+  },
+  "definition_count": 12,
+  "source_claims_reused": 8,
+  "prior_records_preserved": 5302,
+  "prior_claim_revisions_preserved": 2192,
+  "current_open_use_obligations": 12,
+  "consumer_queries": {
+    "conditional_variance": {
+      "definition_retrieved": true,
+      "use_obligation_retrieved": true,
+      "source_revisions_current": true,
+      "status_unpromoted": true,
+      "feasibility": "theoretical_oracle"
+    },
+    "squared_return": {
+      "definition_retrieved": true,
+      "use_obligation_retrieved": true,
+      "source_revisions_current": true,
+      "status_unpromoted": true,
+      "feasibility": "lookahead_dependent"
+    },
+    "realized_stddev": {
+      "definition_retrieved": true,
+      "use_obligation_retrieved": true,
+      "source_revisions_current": true,
+      "status_unpromoted": true,
+      "feasibility": "lookahead_dependent"
+    },
+    "qlike": {
+      "definition_retrieved": true,
+      "use_obligation_retrieved": true,
+      "source_revisions_current": true,
+      "status_unpromoted": true,
+      "feasibility": "implementable_statistic"
+    }
+  },
+  "automatic_consumer_status": "complete",
+  "scientific_execution": "not_run",
+  "formal_checking": "not_run",
+  "empirical_support": false
+}
