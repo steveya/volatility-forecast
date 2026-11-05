@@ -1,0 +1,209 @@
+{
+  "format_version": 1,
+  "owner_project_id": "45ed5482-0932-4c6d-ba3d-a462d933a4b5",
+  "source_snapshot": {
+    "store_id": "8e240fd4-5148-4406-8a52-d7d638ffb6d6",
+    "revision": 11
+  },
+  "sources": {
+    "volatility:literature:v1:handbook-abcd2006:85e49716e6d9fdbf:statement:conditional-target": "24d7cf1a5b7985633d4e68cdd66b613b3a7961d3c3d488ebc7fd4eb3b3aefb7e",
+    "volatility:literature:v1:har-corsi2009:18c305635feefc15:statement:target": "1bb1fe3bc133dac8498dedb9be3a2eeeec21dd442fdfb3ca3a969e20cf0f2fea",
+    "volatility:literature:v1:proxy-patton2011:bfcc630f931a01e5:statement:losses": "6b6ee7e88c836f7533892b01902c94a398ee5a8ed5f97bb2077730067340c2bb",
+    "volatility:literature:v1:proxy-patton2011:bfcc630f931a01e5:statement:robustness": "ffab3095dc7550d2e58b643dc2ac9d5f39685262ded7c38f90c9985aa58d134a",
+    "volatility:literature:v1:proxy-patton2011:bfcc630f931a01e5:statement:target": "49b5da0a754a5e74fea78a5713cb7e8235972d027036ca9c09b49a70f9b8249b",
+    "volatility:literature:v1:realized-abdl2003:d19f59f817bc08f8:statement:abdl-conditional-vs-realized": "0bed3d42c0b4f96a7153f48d621dabf139e6031cb4dc12a3a6cad3c2fb8a72bf",
+    "volatility:literature:v1:realized-abdl2003:d19f59f817bc08f8:statement:abdl-rv-qv": "cbcaf7aa72d4cb1a5e59419a323173f04a3d74ef06d42dc49f961d22d5b20ca0",
+    "volatility:insight:part1:v1:statement:target-scale": "017e39748c5248e2c55a9110a58fe4bd3066608b5ff6f64623f0b2554c63b218"
+  },
+  "definition_sources": {
+    "conditional_variance": [
+      "volatility:literature:v1:handbook-abcd2006:85e49716e6d9fdbf:statement:conditional-target",
+      "volatility:literature:v1:realized-abdl2003:d19f59f817bc08f8:statement:abdl-conditional-vs-realized"
+    ],
+    "conditional_second_moment": [
+      "volatility:literature:v1:handbook-abcd2006:85e49716e6d9fdbf:statement:conditional-target",
+      "volatility:literature:v1:proxy-patton2011:bfcc630f931a01e5:statement:target",
+      "volatility:insight:part1:v1:statement:target-scale"
+    ],
+    "conditional_stddev": [
+      "volatility:literature:v1:handbook-abcd2006:85e49716e6d9fdbf:statement:conditional-target",
+      "volatility:insight:part1:v1:statement:target-scale"
+    ],
+    "squared_return": [
+      "volatility:literature:v1:proxy-patton2011:bfcc630f931a01e5:statement:target",
+      "volatility:literature:v1:handbook-abcd2006:85e49716e6d9fdbf:statement:conditional-target"
+    ],
+    "squared_innovation": [
+      "volatility:literature:v1:handbook-abcd2006:85e49716e6d9fdbf:statement:conditional-target",
+      "volatility:insight:part1:v1:statement:target-scale"
+    ],
+    "realized_variance": [
+      "volatility:literature:v1:realized-abdl2003:d19f59f817bc08f8:statement:abdl-rv-qv",
+      "volatility:literature:v1:realized-abdl2003:d19f59f817bc08f8:statement:abdl-conditional-vs-realized"
+    ],
+    "realized_stddev": [
+      "volatility:literature:v1:har-corsi2009:18c305635feefc15:statement:target",
+      "volatility:literature:v1:realized-abdl2003:d19f59f817bc08f8:statement:abdl-rv-qv"
+    ],
+    "corsi_weekly_volatility": [
+      "volatility:literature:v1:har-corsi2009:18c305635feefc15:statement:target"
+    ],
+    "mse": [
+      "volatility:literature:v1:proxy-patton2011:bfcc630f931a01e5:statement:losses",
+      "volatility:literature:v1:proxy-patton2011:bfcc630f931a01e5:statement:robustness"
+    ],
+    "rmse": [
+      "volatility:literature:v1:proxy-patton2011:bfcc630f931a01e5:statement:losses",
+      "volatility:insight:part1:v1:statement:target-scale"
+    ],
+    "qlike": [
+      "volatility:literature:v1:proxy-patton2011:bfcc630f931a01e5:statement:losses",
+      "volatility:literature:v1:proxy-patton2011:bfcc630f931a01e5:statement:robustness"
+    ],
+    "qlike_ratio": [
+      "volatility:literature:v1:proxy-patton2011:bfcc630f931a01e5:statement:losses",
+      "volatility:literature:v1:proxy-patton2011:bfcc630f931a01e5:statement:robustness"
+    ]
+  },
+  "source_locators": {
+    "volatility:literature:v1:handbook-abcd2006:85e49716e6d9fdbf:statement:conditional-target": {
+      "title": "A volatility forecast target needs an information set and horizon",
+      "locators": [
+        {
+          "doc_id": "volatility:literature:v1:handbook-abcd2006:85e49716e6d9fdbf:document",
+          "document_sha256": "85e49716e6d9fdbf53afe20ebcbcb8d0554334bf72c91e5a2808e7297ae0c362",
+          "source_uri": "/Users/steveyang/Library/CloudStorage/GoogleDrive-steveya@gmail.com/My Drive/Library/volatility-forecasting/foundation-sources-2026-10-31/handbook-abcd2006-85e49716e6d9fdbf.pdf",
+          "location": "PDF page 5 (one based); printed p781, Section1.1 complete Eqs1.1-1.5, conditional moment existence, information and return horizon",
+          "label": "printed p781, Section1.1 complete Eqs1.1-1.5, conditional moment existence, information and return horizon"
+        }
+      ]
+    },
+    "volatility:literature:v1:har-corsi2009:18c305635feefc15:statement:target": {
+      "title": "Original HAR forecasts realized standard deviation",
+      "locators": [
+        {
+          "doc_id": "volatility:literature:v1:har-corsi2009:18c305635feefc15:document",
+          "document_sha256": "18c305635feefc152a0522791de67677b5db037dd10958a09134c7d55cf222e5",
+          "source_uri": "/Users/steveyang/Library/CloudStorage/GoogleDrive-steveya@gmail.com/My Drive/Library/volatility-forecasting/primary-sources-2026-10-31/har-corsi2009-18c305635feefc15.pdf",
+          "location": "PDF page 4 (one based); printed p.177, Eqs.(2)-(4), footnote4; extracted-text page lines 16-26",
+          "label": "printed p.177, Eqs.(2)-(4), footnote4; extracted-text page lines 16-26"
+        }
+      ]
+    },
+    "volatility:literature:v1:proxy-patton2011:bfcc630f931a01e5:statement:losses": {
+      "title": "MSE and QLIKE are source-supported variance losses",
+      "locators": [
+        {
+          "doc_id": "volatility:literature:v1:proxy-patton2011:bfcc630f931a01e5:document",
+          "document_sha256": "bfcc630f931a01e5c678c77d0f98240aa538af0bc5d1153f657d45c12b0ab64a",
+          "source_uri": "/Users/steveyang/Library/CloudStorage/GoogleDrive-steveya@gmail.com/My Drive/Library/volatility-forecasting/primary-sources-2026-10-31/proxy-patton2011-bfcc630f931a01e5.pdf",
+          "location": "PDF page 6 (one based); printed p.251, Proposition1, assumptionsA1-A5, Remark2; extracted-text page lines 114-124",
+          "label": "printed p.251, Proposition1, assumptionsA1-A5, Remark2; extracted-text page lines 114-124"
+        },
+        {
+          "doc_id": "volatility:literature:v1:proxy-patton2011:bfcc630f931a01e5:document",
+          "document_sha256": "bfcc630f931a01e5c678c77d0f98240aa538af0bc5d1153f657d45c12b0ab64a",
+          "source_uri": "/Users/steveyang/Library/CloudStorage/GoogleDrive-steveya@gmail.com/My Drive/Library/volatility-forecasting/primary-sources-2026-10-31/proxy-patton2011-bfcc630f931a01e5.pdf",
+          "location": "PDF page 3 (one based); printed p.248, QLIKE loss Eq.(6); extracted-text page lines 31-41",
+          "label": "printed p.248, QLIKE loss Eq.(6); extracted-text page lines 31-41"
+        },
+        {
+          "doc_id": "volatility:literature:v1:proxy-patton2011:bfcc630f931a01e5:document",
+          "document_sha256": "bfcc630f931a01e5c678c77d0f98240aa538af0bc5d1153f657d45c12b0ab64a",
+          "source_uri": "/Users/steveyang/Library/CloudStorage/GoogleDrive-steveya@gmail.com/My Drive/Library/volatility-forecasting/primary-sources-2026-10-31/proxy-patton2011-bfcc630f931a01e5.pdf",
+          "location": "PDF page 6 (one based); printed p.251, robust loss assumptions A3-A5; extracted-text page lines 118-128",
+          "label": "printed p.251, robust loss assumptions A3-A5; extracted-text page lines 118-128"
+        }
+      ]
+    },
+    "volatility:literature:v1:proxy-patton2011:bfcc630f931a01e5:statement:robustness": {
+      "title": "Proxy robustness is expected-ranking preservation",
+      "locators": [
+        {
+          "doc_id": "volatility:literature:v1:proxy-patton2011:bfcc630f931a01e5:document",
+          "document_sha256": "bfcc630f931a01e5c678c77d0f98240aa538af0bc5d1153f657d45c12b0ab64a",
+          "source_uri": "/Users/steveyang/Library/CloudStorage/GoogleDrive-steveya@gmail.com/My Drive/Library/volatility-forecasting/primary-sources-2026-10-31/proxy-patton2011-bfcc630f931a01e5.pdf",
+          "location": "PDF page 3 (one based); printed p.248, Definition1 and footnote6; extracted-text page lines 20-30",
+          "label": "printed p.248, Definition1 and footnote6; extracted-text page lines 20-30"
+        }
+      ]
+    },
+    "volatility:literature:v1:proxy-patton2011:bfcc630f931a01e5:statement:target": {
+      "title": "Loss choice determines the forecasting target",
+      "locators": [
+        {
+          "doc_id": "volatility:literature:v1:proxy-patton2011:bfcc630f931a01e5:document",
+          "document_sha256": "bfcc630f931a01e5c678c77d0f98240aa538af0bc5d1153f657d45c12b0ab64a",
+          "source_uri": "/Users/steveyang/Library/CloudStorage/GoogleDrive-steveya@gmail.com/My Drive/Library/volatility-forecasting/primary-sources-2026-10-31/proxy-patton2011-bfcc630f931a01e5.pdf",
+          "location": "PDF page 2 (one based); printed p.247, Introduction and Section1.1; extracted-text page lines 6-16",
+          "label": "printed p.247, Introduction and Section1.1; extracted-text page lines 6-16"
+        }
+      ]
+    },
+    "volatility:literature:v1:realized-abdl2003:d19f59f817bc08f8:statement:abdl-conditional-vs-realized": {
+      "title": "Conditional covariance needs mean terms and conditional expectations",
+      "locators": [
+        {
+          "doc_id": "volatility:literature:v1:realized-abdl2003:d19f59f817bc08f8:document",
+          "document_sha256": "d19f59f817bc08f8a5e1432a59aacde7f2fbbb006a61d6f9d339d6001bc674c8",
+          "source_uri": "/Users/steveyang/Library/CloudStorage/GoogleDrive-steveya@gmail.com/My Drive/Library/volatility-forecasting/foundation-sources-2026-10-31/realized-abdl2003-d19f59f817bc08f8.pdf",
+          "location": "PDF page 7 (one based); printed p585, Theorem 1, eq5, mean variance and mean-innovation cross terms",
+          "label": "printed p585, Theorem 1, eq5, mean variance and mean-innovation cross terms"
+        },
+        {
+          "doc_id": "volatility:literature:v1:realized-abdl2003:d19f59f817bc08f8:document",
+          "document_sha256": "d19f59f817bc08f8a5e1432a59aacde7f2fbbb006a61d6f9d339d6001bc674c8",
+          "source_uri": "/Users/steveyang/Library/CloudStorage/GoogleDrive-steveya@gmail.com/My Drive/Library/volatility-forecasting/foundation-sources-2026-10-31/realized-abdl2003-d19f59f817bc08f8.pdf",
+          "location": "PDF page 8 (one based); printed p586, Corollary 1, independence and predetermined-mean cases, eq6",
+          "label": "printed p586, Corollary 1, independence and predetermined-mean cases, eq6"
+        },
+        {
+          "doc_id": "volatility:literature:v1:realized-abdl2003:d19f59f817bc08f8:document",
+          "document_sha256": "d19f59f817bc08f8a5e1432a59aacde7f2fbbb006a61d6f9d339d6001bc674c8",
+          "source_uri": "/Users/steveyang/Library/CloudStorage/GoogleDrive-steveya@gmail.com/My Drive/Library/volatility-forecasting/foundation-sources-2026-10-31/realized-abdl2003-d19f59f817bc08f8.pdf",
+          "location": "PDF page 9 (one based); printed p587, Corollary interpretation, feedback restrictions and empirical approximation boundary",
+          "label": "printed p587, Corollary interpretation, feedback restrictions and empirical approximation boundary"
+        }
+      ]
+    },
+    "volatility:literature:v1:realized-abdl2003:d19f59f817bc08f8:statement:abdl-rv-qv": {
+      "title": "Realized covariance is a finite-grid squared-return measure",
+      "locators": [
+        {
+          "doc_id": "volatility:literature:v1:realized-abdl2003:d19f59f817bc08f8:document",
+          "document_sha256": "d19f59f817bc08f8a5e1432a59aacde7f2fbbb006a61d6f9d339d6001bc674c8",
+          "source_uri": "/Users/steveyang/Library/CloudStorage/GoogleDrive-steveya@gmail.com/My Drive/Library/volatility-forecasting/foundation-sources-2026-10-31/realized-abdl2003-d19f59f817bc08f8.pdf",
+          "location": "PDF page 16 (one based); printed p594, Section 3.2, eq12 and empirical counterpart paragraph",
+          "label": "printed p594, Section 3.2, eq12 and empirical counterpart paragraph"
+        },
+        {
+          "doc_id": "volatility:literature:v1:realized-abdl2003:d19f59f817bc08f8:document",
+          "document_sha256": "d19f59f817bc08f8a5e1432a59aacde7f2fbbb006a61d6f9d339d6001bc674c8",
+          "source_uri": "/Users/steveyang/Library/CloudStorage/GoogleDrive-steveya@gmail.com/My Drive/Library/volatility-forecasting/foundation-sources-2026-10-31/realized-abdl2003-d19f59f817bc08f8.pdf",
+          "location": "PDF page 6 (one based); printed p584, Proposition 2(i), eq3, refining partitions and uniform-in-probability convergence",
+          "label": "printed p584, Proposition 2(i), eq3, refining partitions and uniform-in-probability convergence"
+        },
+        {
+          "doc_id": "volatility:literature:v1:realized-abdl2003:d19f59f817bc08f8:document",
+          "document_sha256": "d19f59f817bc08f8a5e1432a59aacde7f2fbbb006a61d6f9d339d6001bc674c8",
+          "source_uri": "/Users/steveyang/Library/CloudStorage/GoogleDrive-steveya@gmail.com/My Drive/Library/volatility-forecasting/foundation-sources-2026-10-31/realized-abdl2003-d19f59f817bc08f8.pdf",
+          "location": "PDF page 17 (one based); printed p595, Section 3.2, diagonal realized-variance and off-diagonal covariance roles",
+          "label": "printed p595, Section 3.2, diagonal realized-variance and off-diagonal covariance roles"
+        }
+      ]
+    },
+    "volatility:insight:part1:v1:statement:target-scale": {
+      "title": "Nonlinearity belongs to a target, information set and loss",
+      "locators": [
+        {
+          "doc_id": "volatility:insight:part1:v1:document:ca91b615f121f7cf",
+          "document_sha256": "ca91b615f121f7cfc90ac976fa755e15c876f1aecd0ee61acec7bcbcf9f01d1a",
+          "source_uri": "/Users/steveyang/Projects/steveya/volatility-forecast/.synapse/artifacts/part1-insight-hypergraph-2026-10-31/source-memo.md",
+          "location": "Markdown section: Nonlinearity belongs to a target, information set and loss",
+          "label": "Curator candidate: Nonlinearity belongs to a target, information set and loss"
+        }
+      ]
+    }
+  },
+  "status": "Reviewed operational normalization input; source identities are not source authentication or empirical support."
+}

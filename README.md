@@ -40,6 +40,15 @@ target and variance arrays with at least two observations and a finite positive
 fixed warm-start state. `rmse` training uses MSE while RMSE scoring remains
 available.
 
+## Operational Knowledge Definitions
+
+[VOL-7's reviewed target/proxy/loss slice](doc/reviews/volatility-definition-slice-2026-11-04.md)
+connects existing source claims to twelve versioned operational definitions and
+explicit scientific-use obligations. The domain checker supports declared-context
+compatibility and finite-sample loss arithmetic; source validity, proxy mappings,
+expected rankings and statistical inference require separate evidence. The
+review documents the source map, native consumer checks and reproducible commands.
+
 ## Executive Summary
 
 ### Volatility Forecasts: Part 1 - Baseline Model
