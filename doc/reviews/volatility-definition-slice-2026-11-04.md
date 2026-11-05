@@ -136,6 +136,15 @@ or replace a collection. Existing output directories are refused.
 
 ## Remaining work
 
+VOL-7 landed in [PR #7](https://github.com/steveya/volatility-forecast/pull/7)
+at `1d08e5eac97e1726761e8fba53d74753f0682b7c`. Hosted CI passed Python 3.11 and
+3.12 in [run 41949706351](https://github.com/steveya/volatility-forecast/actions/runs/41949706351).
+The automatic GitHub Codex review completed on `5933e34` with no findings.
+The [completed execution mirror](../plan/done__volatility-definition-slice.md)
+matches Linear Done. The local optional Torch baseline discrepancy remains
+[VOL-8](https://linear.app/quant-macro/issue/VOL-8), distinct from the passing
+definition-slice and hosted checks. No CI bypass was used.
+
 SPS-28 retains general shared-definition composition; SPS-74 owns a trusted
 claim/check empirical-use mapping; SPS-75/104 own prespecified real-workflow and
 human evaluation. The broader reconstruction plan, model code and existing

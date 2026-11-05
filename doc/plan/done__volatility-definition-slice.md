@@ -1,6 +1,11 @@
-# Volatility operational-definition slice
+# Completed volatility operational-definition slice
 
 Status synced: 2026-11-04 America/New_York. Linear is authoritative.
+
+VOL-7 is Done after PR #7 merged as `1d08e5e`. Hosted CI passed on Python 3.11
+and 3.12, and the GitHub code review completed without findings. Native owner
+revision 12 and all consumer gates passed. This plan is retained as a completed
+execution mirror; the broader SPS-28/74/75 milestones remain separate.
 
 ## Objective and scope
 
@@ -18,10 +23,11 @@ validity, population inference and a generic empirical-use kernel remain open.
 
 | Order | Ticket | State | Observable gate |
 |---|---|---|---|
-| 1 | [VOL-7](https://linear.app/quant-macro/issue/VOL-7) | In Progress | Reviewed definition map; domain regressions; preserved original records; fresh native source/status/feasibility readback; repository review and landing |
+| 1 | [VOL-7](https://linear.app/quant-macro/issue/VOL-7) | Done | PR #7 merged; 76 focused cases pass; native revision 12 source/status/feasibility and preservation checks pass; hosted CI and GitHub review pass |
 
-Select VOL-7 under the user's explicit direction. Reaudit live scope and state
-before further implementation; do not select from older reconstruction tables.
+VOL-7 was selected under the user's explicit direction. There is no remaining
+implementation ticket in this completed slice. Reaudit live scope and state
+before selecting a follow-on; do not select from older reconstruction tables.
 Existing [SPS-28](https://linear.app/quant-macro/issue/SPS-28) owns the broader
 scientific-type milestone. [SPS-74](https://linear.app/quant-macro/issue/SPS-74)
 owns claim/check empirical-use assessment; [SPS-75](https://linear.app/quant-macro/issue/SPS-75)
@@ -49,9 +55,10 @@ SPS-104 can start separately; its checked-use evaluation arm needs SPS-74.
 
 ## Closeout
 
-Mark VOL-7 Done only after its agreed review/validation and landing gates.
-Rename this plan to `done__volatility-definition-slice.md` after the Linear
-closeout. A successful serialization, compatible declaration, or lower loss on
+The agreed review/validation and landing gates are complete and Linear is Done.
+The optional-backend baseline precision failure is tracked separately as
+[VOL-8](https://linear.app/quant-macro/issue/VOL-8). A successful serialization,
+compatible declaration, or lower loss on
 supplied observations does not close scientific proxy or inference obligations.
 Keep findings and actual execution evidence in the separate review ledger.
 
