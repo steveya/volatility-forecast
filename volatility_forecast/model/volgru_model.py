@@ -13,7 +13,7 @@ import numpy as np
 from .base_model import BaseVolatilityModel
 
 logger = logging.getLogger(__name__)
-from .volgru_config import VolGRUConfig
+from .volgru_config import _LEGACY_DTYPE_BACKFILLED_IDS, VolGRUConfig
 from .volgru_utils import (
     _check_schema,
     _coerce_X,
@@ -58,6 +58,40 @@ class VolGRUModel(BaseVolatilityModel):
                 "Set batch_size=None for full-sequence training."
             )
 
+    def _torch_dtype(self) -> Any:
+        import torch
+
+        cfg_dtype = getattr(self.config, "dtype", "float32")
+        if cfg_dtype == "float64":
+            return torch.float64
+        if cfg_dtype == "float32":
+            return torch.float32
+        raise ValueError(f"Unsupported VolGRU dtype={cfg_dtype!r}")
+
+    def _sync_torch_module_dtype(self, target_dtype: Any) -> None:
+        assert self.torch_module_ is not None
+        if any(p.dtype != target_dtype for p in self.torch_module_.parameters()) or any(
+            b.dtype != target_dtype and b.is_floating_point()
+            for b in self.torch_module_.buffers()
+        ):
+            self.torch_module_.to(dtype=target_dtype)
+        self.torch_module_.cell.dtype = target_dtype
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        cfg = self.__dict__.get("config")
+        if cfg is None:
+            return
+        legacy_dtype = id(cfg) in _LEGACY_DTYPE_BACKFILLED_IDS
+        _LEGACY_DTYPE_BACKFILLED_IDS.discard(id(cfg))
+        module = self.__dict__.get("torch_module_")
+        if legacy_dtype and module is not None:
+            import torch
+
+            if any(p.dtype == torch.float64 for p in module.parameters()):
+                cfg.dtype = "float64"
+                self._sync_torch_module_dtype(torch.float64)
+
     def _ensure_torch_module(self, n_features: int) -> None:
         try:
             import torch
@@ -66,13 +100,14 @@ class VolGRUModel(BaseVolatilityModel):
 
         from .volgru_torch import VolGRUModelTorch
 
+        target_dtype = self._torch_dtype()
         if self.torch_module_ is None:
             if self.random_state is not None:
                 torch.manual_seed(int(self.random_state))
             self.torch_module_ = VolGRUModelTorch(
                 config=self.config,
                 n_features=n_features,
-                dtype=torch.float32,
+                dtype=target_dtype,
             )
             return
         if int(self.torch_module_.n_features) != int(n_features):
@@ -80,6 +115,7 @@ class VolGRUModel(BaseVolatilityModel):
                 "Feature count mismatch with existing torch model: "
                 f"{self.torch_module_.n_features} vs {n_features}"
             )
+        self._sync_torch_module_dtype(target_dtype)
 
     def _backend_feature_count(self) -> int | None:
         if self.torch_module_ is None:
@@ -100,7 +136,7 @@ class VolGRUModel(BaseVolatilityModel):
         assert self.torch_module_ is not None
         import torch
 
-        beta_t = torch.as_tensor(beta_np, dtype=torch.float32)
+        beta_t = torch.as_tensor(beta_np, dtype=self._torch_dtype())
         self.torch_module_.set_gate_beta(beta_t)
         return self
 
@@ -110,6 +146,7 @@ class VolGRUModel(BaseVolatilityModel):
             raise ValueError(
                 "Model not initialized. Call fit() or set_gate_beta() first."
             )
+        self._sync_torch_module_dtype(self._torch_dtype())
         beta_t = self.torch_module_.get_gate_beta()
         return beta_t.detach().cpu().numpy()
 
@@ -382,11 +419,12 @@ class VolGRUModel(BaseVolatilityModel):
         assert self.torch_module_ is not None
         self.torch_module_.train()
 
-        X_t = torch.as_tensor(X, dtype=torch.float32)
-        y_t = torch.as_tensor(y, dtype=torch.float32)
-        r_t = torch.as_tensor(returns, dtype=torch.float32)
-        init_var_t = torch.tensor(float(init_var), dtype=torch.float32)
-        r_next_t = torch.as_tensor(align_returns_next(returns), dtype=torch.float32)
+        target_dtype = self._torch_dtype()
+        X_t = torch.as_tensor(X, dtype=target_dtype)
+        y_t = torch.as_tensor(y, dtype=target_dtype)
+        r_t = torch.as_tensor(returns, dtype=target_dtype)
+        init_var_t = torch.tensor(float(init_var), dtype=target_dtype)
+        r_next_t = torch.as_tensor(align_returns_next(returns), dtype=target_dtype)
 
         gate_params = list(self.torch_module_.gate_parameters())
         cand_params = list(self.torch_module_.candidate_parameters())
@@ -410,7 +448,7 @@ class VolGRUModel(BaseVolatilityModel):
 
         optimizer = torch.optim.AdamW(param_groups, lr=float(self.config.lr))
         beta_ref_t = (
-            None if beta_ref is None else torch.as_tensor(beta_ref, dtype=torch.float32)
+            None if beta_ref is None else torch.as_tensor(beta_ref, dtype=target_dtype)
         )
 
         best_loss = float("inf")
@@ -591,9 +629,11 @@ class VolGRUModel(BaseVolatilityModel):
 
         assert self.torch_module_ is not None
         self.torch_module_.eval()
-        X_t = torch.as_tensor(X, dtype=torch.float32)
-        r_t = torch.as_tensor(returns, dtype=torch.float32)
-        init_var_t = torch.tensor(float(init_var), dtype=torch.float32)
+        target_dtype = self._torch_dtype()
+        self._sync_torch_module_dtype(target_dtype)
+        X_t = torch.as_tensor(X, dtype=target_dtype)
+        r_t = torch.as_tensor(returns, dtype=target_dtype)
+        init_var_t = torch.tensor(float(init_var), dtype=target_dtype)
         with torch.no_grad():
             sigma2_next, z_t, v_cand_t, final_var = self.torch_module_.forward_sequence(
                 X=X_t,

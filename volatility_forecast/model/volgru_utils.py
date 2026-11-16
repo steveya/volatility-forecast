@@ -107,7 +107,14 @@ def nll_gaussian_torch(returns_next: Any, sigma2_next: Any, eps: float = 1e-12) 
 
 def gate_entropy_term_torch(z: Any, eps: float = 1e-12) -> Any:
     """Mean z*log(z) + (1-z)*log(1-z), clamped for numerical safety."""
-    zc = z.clamp(min=float(eps), max=1.0 - float(eps))
+    import torch
+
+    safe_eps = float(eps)
+    if torch.is_tensor(z) and torch.is_floating_point(z):
+        # Prevent 1.0 - eps from rounding to 1.0 in float32 (which causes 0 * -inf = NaN).
+        safe_eps = max(safe_eps, float(torch.finfo(z.dtype).eps))
+    safe_eps = min(safe_eps, 0.25)
+    zc = z.clamp(min=safe_eps, max=1.0 - safe_eps)
     return (zc * zc.log() + (1.0 - zc) * (1.0 - zc).log()).mean()
 
 
