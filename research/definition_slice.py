@@ -191,199 +191,728 @@ def compare(left, right, observations, left_forecasts, right_forecasts, *, reque
         return replace(report, status='incompatible', reasons=report.reasons+(str(exc),))
 
 
-def build_delta(base, packet):
-    """Compile reviewed normalization records; original source IDs never change."""
-    from synapse.graph.dag import EpistemicDAG
-    from synapse.models.core import (AtomicStatement, Construct, ConstructKind, KnowledgeOrigin,
-        Scope, SourceDocument, SourceAnchor, TopicAssembly, AssemblySection, Symbol, SymbolRole)
-    from synapse.models.quantities import QuantityDefinition, QuantityBundle, ScientificTarget
-    from synapse.models.assessment import RevisionRef
-    from synapse.models.obligations import KnowledgeObligation, KnowledgeRef, CandidateDependency
-    from synapse.obligations import capture_reference
-    from synapse.quantities import quantity_ref
-    if packet.get('format_version') != 1 or set(packet['definition_sources']) != set(DEFINITIONS):
-        raise ValueError('Unsupported or incomplete definition mapping')
-    for sid, expected in packet['sources'].items():
-        if sid not in base.statements or capture_reference(base, KnowledgeRef(kind='statement', node_id=sid)) != expected:
-            raise ValueError('Changed or missing source revision: '+sid)
-    for key, sources in packet['definition_sources'].items():
-        if not sources or len(sources) != len(set(sources)) or any(sid not in packet['sources'] for sid in sources):
-            raise ValueError('Missing or invalid definition source mapping: '+key)
-    delta = EpistemicDAG()
-    module_path = Path(__file__).resolve()
-    doc_id = PREFIX+'normalization-source'
-    delta.add_document(SourceDocument(doc_id=doc_id, title='VOL-7 reviewed local operational definitions',
-        source_type='code_repo', path_or_uri=str(module_path), content_hash=sha256(module_path.read_bytes()).hexdigest(),
-        search_keywords=['shared volatility definitions', 'target proxy loss', POLICY_DIGEST]))
-    for key, role, clock, description in (
-        ('latent_variance',SymbolRole.UNOBSERVED_TRUTH,'t','Unknown conditional variance given F_t'),
-        ('latent_second_moment',SymbolRole.UNOBSERVED_TRUTH,'t','Unknown conditional second moment given F_t'),
-        ('latent_mean',SymbolRole.UNOBSERVED_TRUTH,'t','Unknown true conditional mean given F_t'),
-        ('future_returns',SymbolRole.OBSERVABLE,'t+h','Returns over the future outcome interval; not known at forecast origin t'),
-        ('forecast',SymbolRole.OBSERVABLE,'t','Declared origin-measurable forecast; actual timestamp authentication remains unresolved'),
+def _symbol_keys_for_definition(key: str, entry: MappingProxyType[str, str]) -> list[str]:
+    special = {
+        'conditional_variance': ['latent_variance'],
+        'conditional_second_moment': ['latent_second_moment'],
+        'conditional_stddev': ['latent_variance'],
+        'squared_innovation': ['future_returns', 'latent_mean'],
+    }
+    if key in special:
+        return special[key]
+    return ['future_returns', 'forecast'] if entry['role'] == 'loss' else ['future_returns']
+
+
+def _normalize_claim_ref(store: object, ref: str) -> str:
+    if not isinstance(ref, str) or not ref.startswith('synapse://'):
+        return ref
+    from synapse.digest import parse_synapse_uri
+
+    parsed = parse_synapse_uri(ref)
+    if parsed.kind == 'claim' and parsed.namespace in store.local_namespaces():
+        return parsed.record_id
+    return ref
+
+
+def compute_construct_feasibility(store: object, construct_id: str) -> dict[str, object]:
+    """Classify a definition construct as oracle, lookahead_dependent, or implementable."""
+    construct = store.get_object(construct_id)
+    if construct is None:
+        raise KeyError(f'Unknown construct {construct_id!r}')
+    spec = dict(construct.spec_payload)
+    symbol_ids = spec.get('uses_symbols')
+    if not isinstance(symbol_ids, list) or not symbol_ids:
+        raise KeyError(f'Missing or empty bound symbols for {construct_id!r}')
+    unobserved: list[str] = []
+    lookahead: list[str] = []
+    for sym_id in symbol_ids:
+        if not isinstance(sym_id, str) or not sym_id:
+            raise KeyError(f'Invalid bound symbol id {sym_id!r} for {construct_id!r}')
+        sym = store.get_object(sym_id)
+        if sym is None:
+            raise KeyError(f'Missing bound symbol {sym_id!r} for {construct_id!r}')
+        sym_spec = sym.spec_payload
+        if sym_spec.get('role') == 'unobserved_truth':
+            unobserved.append(sym_id)
+        if sym_spec.get('measurable_at') == 't+h':
+            lookahead.append(sym_id)
+    if unobserved:
+        status = 'theoretical_oracle'
+    elif spec.get('decision_time') == 't+h' or lookahead:
+        status = 'lookahead_dependent'
+    else:
+        status = 'implementable_statistic'
+    return {
+        'construct_id': construct_id,
+        'status': status,
+        'unobserved_symbols': unobserved,
+        'lookahead_symbols': lookahead,
+    }
+
+
+def build_delta(store: object, packet: dict) -> dict:
+    """Publish reviewed operational volatility definitions into a Synapse v3.0 store."""
+    from synapse.digest import sha256_hex
+    from synapse.models import (
+        AssemblySection,
+        Claim,
+        DigestConflictError,
+        Edge,
+        ObjectRecord,
+        SourceDocument,
+        SourcePassage,
+        TopicAssembly,
+    )
+
+    if not isinstance(packet, dict) or packet.get('format_version') != 1:
+        raise ValueError('Unsupported or missing definition packet format_version')
+    sources_map = packet.get('sources')
+    def_sources = packet.get('definition_sources')
+    if (
+        not isinstance(sources_map, dict)
+        or not isinstance(def_sources, dict)
+        or set(def_sources) != set(DEFINITIONS)
     ):
-        delta.add_symbol(Symbol(symbol_id=PREFIX+'symbol:'+key,name=key,latex=key,
-            description=description,role=role,measurable_at=clock))
-    for key, entry in DEFINITIONS.items():
-        cid, sid = PREFIX+'construct:'+key, PREFIX+'statement:'+key
-        symbols = {'conditional_variance':['latent_variance'], 'conditional_second_moment':['latent_second_moment'],
-            'conditional_stddev':['latent_variance'], 'squared_innovation':['future_returns','latent_mean']}.get(key,
-            ['future_returns','forecast'] if entry['role']=='loss' else ['future_returns'])
-        delta.add_construct(Construct(construct_id=cid, name=key.replace('_', ' '),
-            kind=ConstructKind.LOSS_FUNCTIONAL if entry['role']=='loss' else ConstructKind.MATHEMATICAL_OBJECT,
-            scope=Scope.GLOBAL_CANONICAL, latex_definition=entry['formula'],
-            uses_symbols=[PREFIX+'symbol:'+s for s in symbols],decision_time='t+h' if entry['role']=='loss' else 't',
-            description='Local versioned operational definition; role='+entry['role']+'; scale='+entry['scale']+'; '+entry['conditions']+
-                ' No universal equivalence, implementable estimator, scientific support or formal proof is granted.'))
-        delta.add_statement(AtomicStatement(statement_id=sid, name='Shared definition: '+key.replace('_',' '),
-            scope=Scope.GLOBAL_CANONICAL, primitive_domain='financial_econometrics.volatility.definitions',
-            knowledge_origin=KnowledgeOrigin.AI_DEDUCTIVE_SYNTHESIS, context_constructs=[cid],
-            conclusion_latex=entry['formula'], conclusion_text='CURATOR OPERATIONAL DEFINITION: '+entry['formula']+'. '+entry['conditions']+
-                ' Source correspondence is scoped normalization, not a new source theorem or empirical acceptance.',
-            topic_themes=['shared volatility definitions','target proxy loss',key]))
-        delta.add_anchor(SourceAnchor(anchor_id=sid+':anchor', statement_id=sid, doc_id=doc_id,
-            role_in_doc='definition_property', label_in_doc='DEFINITIONS['+key+']',page_or_cell='DEFINITIONS['+key+']'))
-    targets = tuple(ScientificTarget(target_id=PREFIX+'target:'+key, definition=entry['formula'],
-        retained_assumptions=(entry['conditions'],)) for key,entry in DEFINITIONS.items() if entry['role']=='target')
-    quantities = tuple(QuantityDefinition(**_quantity_payload(key)) for key in DEFINITIONS)
-    for key, quantity in zip(DEFINITIONS, quantities):
-        assert quantity_ref(quantity).model_dump() == asdict(definition_ref(key))
-    bundle = QuantityBundle(bundle_id=PREFIX+'quantity-bundle', description='Symbolic definitions only; no fabricated study, scalar observation, fit or execution.',
-        targets=targets, quantity_definitions=quantities,
-        statement_refs=tuple(RevisionRef(kind='statement',logical_id=PREFIX+'statement:'+key,
-            revision_digest=capture_reference(delta,KnowledgeRef(kind='statement',node_id=PREFIX+'statement:'+key))) for key in DEFINITIONS),
-        source_refs=tuple(RevisionRef(kind='statement',logical_id=sid,revision_digest=digest) for sid,digest in packet['sources'].items()))
-    delta.add_quantity_bundle(bundle)
-    for key, entry in DEFINITIONS.items():
-        sid = PREFIX+'statement:'+key
-        links = tuple(CandidateDependency(source_ref=KnowledgeRef(kind='statement',node_id=source),
-            target_ref=KnowledgeRef(kind='statement',node_id=sid), expected_revision_digest=packet['sources'][source],
-            dependency_kind='source',route_id=PREFIX+'source-route:'+key) for source in packet['definition_sources'][key])
-        delta.add_obligation(KnowledgeObligation(record_id=PREFIX+'use-gap:'+key,obligation_id=PREFIX+'use-gap:'+key,
-            target_ref=KnowledgeRef(kind='statement',node_id=sid), target_revision_digest=capture_reference(delta,KnowledgeRef(kind='statement',node_id=sid)),
-            gap_kind='undercut_application_or_transport', dependencies=links,
-            description='Operational definition and source mapping are retained. Before scientific use, instantiate the target-world horizon, information, units, measurement and relevant assumptions. '+entry['conditions'],
-            permitted_evidence=('reviewed_target_world_mapping','independently_checked_claim_to_procedure_contract','appropriate_empirical_evaluation'),
-            artifact_json=_json({'normalization_key':key,'source_claim_ids':packet['definition_sources'][key],
-                'policy_digest':POLICY_DIGEST,'scientific_support':False,'formal_checking':'not_run'})))
-    delta.add_assembly(TopicAssembly(assembly_id=PREFIX+'assembly',title='Volatility target, proxy and loss definition map',
-        objective='Navigate exact source revisions, shared local definitions and unresolved empirical uses.',
-        sections=[AssemblySection(section_id=PREFIX+'section:'+role,title=role,
-            narrative_goal='Inspect declared definitions with source correspondence and remaining conditions.',
-            primary_statement_ids=[PREFIX+'statement:'+key for key,e in DEFINITIONS.items() if e['role']==role],
-            composed_construct_ids=[PREFIX+'construct:'+key for key,e in DEFINITIONS.items() if e['role']==role]) for role in ('target','measurement','loss')]))
-    return delta
+        raise ValueError('Unsupported or incomplete definition mapping')
+
+    for key, sources in def_sources.items():
+        if (
+            not isinstance(sources, list)
+            or not sources
+            or any(not isinstance(sid, str) or not sid for sid in sources)
+            or len(sources) != len(set(sources))
+            or any(sid not in sources_map for sid in sources)
+        ):
+            raise ValueError('Missing or invalid definition source mapping: ' + key)
+
+    source_digests: dict[str, str] = {}
+    for sid, expected in sources_map.items():
+        if not isinstance(expected, str) or not expected:
+            raise ValueError('Invalid expected source revision digest for: ' + sid)
+        src_claim = store.get_claim(sid)
+        if src_claim is None or src_claim.meaning_digest != expected:
+            raise ValueError('Changed or missing source revision: ' + sid)
+        source_digests[sid] = src_claim.meaning_digest
+
+    for key in DEFINITIONS:
+        sid = PREFIX + 'statement:' + key
+        if store.list_warrants_for_claim(sid):
+            raise ValueError('Cannot overwrite warranted definition claim: ' + sid)
+
+    spec_digest = _digest({k: dict(v) for k, v in DEFINITIONS.items()})
+    module_path = Path(__file__).resolve()
+    doc_id = PREFIX + 'normalization-source'
+    symbol_specs = (
+        ('latent_variance', 'unobserved_truth', 't', 'Unknown conditional variance given F_t'),
+        ('latent_second_moment', 'unobserved_truth', 't', 'Unknown conditional second moment given F_t'),
+        ('latent_mean', 'unobserved_truth', 't', 'Unknown true conditional mean given F_t'),
+        ('future_returns', 'observable', 't+h', 'Returns over the future outcome interval; not known at forecast origin t'),
+        ('forecast', 'observable', 't', 'Declared origin-measurable forecast; actual timestamp authentication remains unresolved'),
+    )
+
+    claim_digests: dict[str, str] = {}
+    with store._tx():
+        existing_doc = store.get_source(doc_id)
+        v1_migrated_doc = (
+            existing_doc is not None
+            and existing_doc.content_sha256 != spec_digest
+            and existing_doc.metadata.get('v1_scope') == 'global_canonical'
+        )
+        if not v1_migrated_doc:
+            store.put_source(
+                SourceDocument(
+                    doc_id=doc_id,
+                    uri_or_path=str(module_path),
+                    content_sha256=spec_digest,
+                    title='VOL-7 reviewed local operational definitions',
+                    media_type='text/plain',
+                    metadata={
+                        'policy_digest': POLICY_DIGEST,
+                        'spec_digest': spec_digest,
+                        'topics': ['shared volatility definitions', 'target proxy loss'],
+                    },
+                )
+            )
+
+        for sym_key, role, clock, description in symbol_specs:
+            sym_id = PREFIX + 'symbol:' + sym_key
+            sym_obj = ObjectRecord(
+                object_id=sym_id,
+                kind='symbol',
+                canonical_name=sym_key,
+                symbol_latex=sym_key,
+                domain_type='volatility_quantity',
+                spec_payload={'role': role, 'measurable_at': clock},
+                title=sym_key,
+                exposition=description,
+            )
+            existing_sym = store.get_object(sym_id)
+            if (
+                existing_sym is not None
+                and existing_sym.kind == 'symbol'
+                and existing_sym.spec_payload.get('role') == role
+                and existing_sym.spec_payload.get('measurable_at') == clock
+                and existing_sym.spec_payload.get('v1_node_type') == 'symbol'
+            ):
+                continue
+            store.put_object(sym_obj)
+
+        for key, entry in DEFINITIONS.items():
+            cid = PREFIX + 'construct:' + key
+            sid = PREFIX + 'statement:' + key
+            pid = sid + ':anchor'
+            sym_keys = _symbol_keys_for_definition(key, entry)
+            sym_ids = [PREFIX + 'symbol:' + s for s in sym_keys]
+            decision_time = 't+h' if entry['role'] == 'loss' else 't'
+            q_payload = _quantity_payload(key)
+            d_ref = asdict(definition_ref(key))
+            verbatim = f"{entry['formula']} — {entry['conditions']}"
+
+            existing_passage = store.get_passage(pid)
+            if not (
+                v1_migrated_doc
+                and existing_passage is not None
+                and existing_passage.doc_id == doc_id
+                and existing_passage.verbatim_text == f'DEFINITIONS[{key}]'
+            ):
+                store.ingest_passages(
+                    [
+                        SourcePassage(
+                            passage_id=pid,
+                            doc_id=doc_id,
+                            locator='DEFINITIONS[' + key + ']',
+                            verbatim_text=verbatim,
+                            content_sha256=sha256_hex(verbatim),
+                            kind='equation',
+                            tags=('shared-volatility-definitions', key),
+                        )
+                    ]
+                )
+
+            con_obj = ObjectRecord(
+                object_id=cid,
+                kind='construct',
+                canonical_name=key,
+                definition_latex=entry['formula'],
+                domain_type=entry['role'],
+                spec_payload={
+                    'role': entry['role'],
+                    'scale': entry['scale'],
+                    'decision_time': decision_time,
+                    'uses_symbols': sym_ids,
+                    'quantity_definition': q_payload,
+                    'definition_ref': d_ref,
+                },
+                title=key.replace('_', ' '),
+                exposition=(
+                    f"Local versioned operational definition; role={entry['role']}; scale={entry['scale']}; "
+                    f"{entry['conditions']} No universal equivalence, implementable estimator, scientific support or formal proof is granted."
+                ),
+            )
+            existing_con = store.get_object(cid)
+            v1_migrated_con = (
+                existing_con is not None
+                and existing_con.kind == 'construct'
+                and existing_con.spec_payload.get('v1_node_type') == 'construct'
+                and existing_con.definition_latex == entry['formula']
+                and existing_con.spec_payload.get('uses_symbols') == sym_ids
+                and existing_con.spec_payload.get('decision_time') == decision_time
+            )
+            if not v1_migrated_con:
+                store.put_object(con_obj)
+
+            claim = Claim(
+                claim_id=sid,
+                claim_kind='definition',
+                bindings=(cid, *sym_ids),
+                mathematical_latex=entry['formula'],
+                title='Shared definition: ' + key.replace('_', ' '),
+                exposition=(
+                    f"CURATOR OPERATIONAL DEFINITION: {entry['formula']}. {entry['conditions']} "
+                    'Source correspondence is scoped normalization, not a new source theorem or empirical acceptance.'
+                ),
+                tags=('shared-volatility-definitions', 'target-proxy-loss', key),
+            )
+            existing_claim = store.get_claim(sid)
+            if existing_claim is None or existing_claim.meaning_digest == claim.meaning_digest:
+                store.promote_passage_to_claim([pid], claim)
+                claim_digests[key] = claim.meaning_digest
+            elif (
+                v1_migrated_con
+                and existing_claim.mathematical_latex == entry['formula']
+                and cid in existing_claim.bindings
+            ):
+                if not any(
+                    e.target_ref == pid
+                    for e in store.list_edges(source_ref=sid, edge_type='sourced_from')
+                ):
+                    store.put_edge(
+                        Edge(
+                            edge_id='src:' + sha256_hex(sid + '\x00' + pid)[:24],
+                            source_ref=sid,
+                            edge_type='sourced_from',
+                            target_ref=pid,
+                            assertion_mode='conjectured',
+                        )
+                    )
+                claim_digests[key] = existing_claim.meaning_digest
+            else:
+                raise DigestConflictError(f'Claim {sid!r} already exists with incompatible meaning_digest')
+
+            gap_id = PREFIX + 'use-gap:' + key
+            gap_obj = ObjectRecord(
+                object_id=gap_id,
+                kind='typed_spec',
+                canonical_name=gap_id,
+                domain_type='use_obligation',
+                spec_payload={
+                    'normalization_key': key,
+                    'target_claim_id': sid,
+                    'target_meaning_digest': claim_digests[key],
+                    'gap_kind': 'undercut_application_or_transport',
+                    'dependencies': [
+                        {
+                            'dependency_kind': 'source',
+                            'route_id': PREFIX + 'source-route:' + key,
+                            'source_ref': {'kind': 'statement', 'node_id': src},
+                            'target_ref': {'kind': 'statement', 'node_id': sid},
+                            'expected_revision_digest': sources_map[src],
+                        }
+                        for src in def_sources[key]
+                    ],
+                    'route_id': PREFIX + 'source-route:' + key,
+                    'policy_digest': POLICY_DIGEST,
+                    'permitted_evidence': [
+                        'reviewed_target_world_mapping',
+                        'independently_checked_claim_to_procedure_contract',
+                        'appropriate_empirical_evaluation',
+                    ],
+                    'scientific_support': False,
+                    'formal_checking': 'not_run',
+                },
+                title=gap_id,
+                exposition=(
+                    'Operational definition and source mapping are retained. Before scientific use, instantiate the '
+                    'target-world horizon, information, units, measurement and relevant assumptions. ' + entry['conditions']
+                ),
+            )
+            existing_gap = store.get_object(gap_id)
+            if existing_gap is not None and existing_gap.meaning_digest != gap_obj.meaning_digest:
+                store.put_object(gap_obj, allow_revision=True, reason='Sync Synapse v3 source meaning_digests')
+            else:
+                store.put_object(gap_obj)
+
+            edge_ids_for_key: list[str] = []
+            for src_id in def_sources[key]:
+                edge_id = f'{PREFIX}source-link:{key}:{sha256_hex(src_id)[:16]}'
+                edge_ids_for_key.append(edge_id)
+                edge = Edge(
+                    edge_id=edge_id,
+                    source_ref=src_id,
+                    edge_type='entails',
+                    target_ref=sid,
+                    assertion_mode='conjectured',
+                    metadata={
+                        'dependency_kind': 'source',
+                        'expected_revision_digest': sources_map[src_id],
+                        'route_id': PREFIX + 'source-route:' + key,
+                    },
+                )
+                existing_edge = store.get_edge(edge_id)
+                if existing_edge is not None and (
+                    existing_edge.source_ref != edge.source_ref
+                    or existing_edge.edge_type != edge.edge_type
+                    or existing_edge.target_ref != edge.target_ref
+                    or existing_edge.assertion_mode != edge.assertion_mode
+                    or existing_edge.metadata != edge.metadata
+                ):
+                    store.put_edge(edge, allow_revision=True, reason='Sync Synapse v3 source revision edge')
+                else:
+                    store.put_edge(edge)
+
+            placeholders = ', '.join('?' for _ in edge_ids_for_key)
+            store.connection.execute(
+                f'DELETE FROM edges WHERE edge_id LIKE ? AND edge_id NOT IN ({placeholders})',
+                [f'{PREFIX}source-link:{key}:%', *edge_ids_for_key],
+            )
+
+        bundle_id = PREFIX + 'quantity-bundle'
+        bundle = ObjectRecord(
+            object_id=bundle_id,
+            kind='typed_spec',
+            canonical_name=bundle_id,
+            domain_type='quantity_bundle',
+            spec_payload={
+                'format_version': 1,
+                'bundle_id': bundle_id,
+                'policy_digest': POLICY_DIGEST,
+                'quantity_definitions': [_quantity_payload(k) for k in DEFINITIONS],
+                'definition_refs': {k: asdict(definition_ref(k)) for k in DEFINITIONS},
+                'claim_digests': claim_digests,
+                'source_digests': source_digests,
+            },
+            title=bundle_id,
+            exposition='Symbolic definitions only; no fabricated study, scalar observation, fit or execution.',
+        )
+        existing_bundle = store.get_object(bundle_id)
+        if existing_bundle is not None and existing_bundle.meaning_digest != bundle.meaning_digest:
+            store.put_object(bundle, allow_revision=True, reason='Sync Synapse v3 quantity bundle')
+        else:
+            store.put_object(bundle)
+
+        sections = tuple(
+            AssemblySection(
+                section_id=PREFIX + 'section:' + role,
+                heading=role,
+                summary='Inspect declared definitions with source correspondence and remaining conditions.',
+                item_refs=tuple(PREFIX + 'statement:' + key for key, entry in DEFINITIONS.items() if entry['role'] == role),
+            )
+            for role in ('target', 'measurement', 'loss')
+        )
+        store.put_assembly(
+            TopicAssembly(
+                assembly_id=PREFIX + 'assembly',
+                title='Volatility target, proxy and loss definition map',
+                summary='Navigate exact source revisions, shared local definitions and unresolved empirical uses.',
+                sections=sections,
+                tags=('shared-volatility-definitions', 'target-proxy-loss'),
+            )
+        )
+    return {'definition_count': len(DEFINITIONS), 'claim_digests': claim_digests, 'source_digests': source_digests}
 
 
-def inspect_definition(dag, key):
-    """Read source mappings from the persisted obligation, not a caller's map."""
-    from synapse.obligations import capture_reference
-    from synapse.models.obligations import KnowledgeRef
-    from synapse.quantities import quantity_ref
-    sid = PREFIX+'statement:'+key
-    statement = dag.statements[sid]
-    gap = dag.obligations[PREFIX+'use-gap:'+key]
-    bundle = dag.quantity_bundles[PREFIX+'quantity-bundle']
-    quantity = next(q for q in bundle.quantity_definitions if q.definition_id==definition_ref(key).logical_id)
-    sources = []
-    for edge in gap.dependencies:
-        if edge.dependency_kind!='source' or edge.target_ref.node_id!=sid:
-            raise ValueError('Unexpected source mapping role or endpoint')
-        source_id = edge.source_ref.node_id
-        source = dag.statements.get(source_id)
-        digest = None if source is None else capture_reference(dag,edge.source_ref)
-        sources.append({'statement_id':source_id,'expected_revision':edge.expected_revision_digest,
-            'observed_revision':digest,'current':digest==edge.expected_revision_digest,
-            'conclusion':None if source is None else source.conclusion_text,
-            'anchors':[a.model_dump(mode='json') for a in dag.anchors.values() if a.statement_id==source_id]})
-    return {'statement_id':sid,'definition_ref':quantity_ref(quantity).model_dump(mode='json'),
-        'definition_matches_current_checker':quantity_ref(quantity).model_dump()==asdict(definition_ref(key)),
-        'scientific_status':statement.epistemic_vector.model_dump(mode='json'),
-        'construct_feasibility':dag.compute_construct_feasibility(PREFIX+'construct:'+key).model_dump(mode='json'),
-        'sources':sources,'open_use_obligation':gap.model_dump(mode='json'),'empirical_support':False}
+def inspect_definition(store: object, key: str) -> dict:
+    """Read source mappings and feasibility from the persisted v3.0 Synapse store."""
+    from synapse.federation import evaluate_claim_epistemic_state, evaluate_warrant_epistemic_state
+
+    sid = PREFIX + 'statement:' + key
+    cid = PREFIX + 'construct:' + key
+    statement = store.get_claim(sid)
+    gap = store.get_object(PREFIX + 'use-gap:' + key)
+    bundle = store.get_object(PREFIX + 'quantity-bundle')
+    if statement is None or gap is None or bundle is None:
+        raise KeyError(f'Missing persisted definition records for {key!r}')
+
+    raw_q_defs = bundle.spec_payload.get('quantity_definitions')
+    target_def_id = PREFIX + 'quantity:' + key
+    matches: list[dict] = []
+    if isinstance(raw_q_defs, list):
+        matches = [
+            item
+            for item in raw_q_defs
+            if isinstance(item, dict) and item.get('definition_id') == target_def_id
+        ]
+    elif isinstance(raw_q_defs, dict):
+        candidate = raw_q_defs.get(key)
+        if isinstance(candidate, dict) and candidate.get('definition_id') == target_def_id:
+            matches = [candidate]
+    else:
+        raise ValueError(f'Invalid quantity_definitions container in {bundle.object_id}')
+    if len(matches) != 1 or not isinstance(matches[0].get('formula'), str):
+        raise ValueError(f'Missing or malformed quantity definition {key!r} in {bundle.object_id}')
+    q_payload = matches[0]
+    persisted_def_ref = {
+        'kind': 'quantity_definition',
+        'logical_id': q_payload['definition_id'],
+        'revision_digest': _digest(q_payload),
+    }
+
+    deps = gap.spec_payload.get('dependencies')
+    if not isinstance(deps, list) or not deps:
+        raise ValueError('Missing or malformed source dependencies')
+    expected_by_source: dict[str, str] = {}
+    for dep in deps:
+        if not isinstance(dep, dict) or dep.get('dependency_kind') != 'source':
+            raise ValueError('Missing or malformed source dependencies')
+        t_ref = dep.get('target_ref')
+        s_ref = dep.get('source_ref')
+        expected_rev = dep.get('expected_revision_digest')
+        if (
+            not isinstance(t_ref, dict)
+            or _normalize_claim_ref(store, str(t_ref.get('node_id', ''))) != sid
+            or not isinstance(s_ref, dict)
+            or not isinstance(s_ref.get('node_id'), str)
+            or not s_ref['node_id']
+            or not isinstance(expected_rev, str)
+            or not expected_rev
+        ):
+            raise ValueError('Missing or malformed source dependencies')
+        src_id = _normalize_claim_ref(store, s_ref['node_id'])
+        if src_id in expected_by_source:
+            raise ValueError(f'Duplicate source dependency {src_id!r}')
+        expected_by_source[src_id] = expected_rev
+
+    all_in_entails = [
+        e for e in store.list_edges(edge_type='entails') if _normalize_claim_ref(store, e.target_ref) == sid
+    ]
+    pre_refresh_v1 = (not all_in_entails) and (gap.spec_payload.get('v1_node_type') == 'obligation')
+    if not pre_refresh_v1:
+        seen_sources: dict[str, object] = {}
+        for edge in all_in_entails:
+            src_norm = _normalize_claim_ref(store, edge.source_ref)
+            if (
+                edge.assertion_mode != 'conjectured'
+                or edge.metadata.get('dependency_kind') != 'source'
+                or src_norm not in expected_by_source
+                or edge.metadata.get('expected_revision_digest') != expected_by_source[src_norm]
+                or src_norm in seen_sources
+            ):
+                raise ValueError('Unexpected or mismatched source entails edges')
+            seen_sources[src_norm] = edge
+        if set(seen_sources) != set(expected_by_source):
+            raise ValueError('Unexpected or mismatched source entails edges')
+
+    sources: list[dict[str, object]] = []
+    for source_id, expected_rev in expected_by_source.items():
+        src_claim = store.get_claim(source_id)
+        observed = None if src_claim is None else src_claim.meaning_digest
+        src_passages = [
+            p.model_dump(mode='json')
+            for e in store.list_edges(source_ref=source_id, edge_type='sourced_from')
+            if (p := store.get_passage(e.target_ref)) is not None
+        ]
+        sources.append(
+            {
+                'statement_id': source_id,
+                'expected_revision': expected_rev,
+                'observed_revision': observed,
+                'current': observed == expected_rev,
+                'conclusion': None if src_claim is None else (src_claim.title or src_claim.mathematical_latex),
+                'passages': src_passages,
+            }
+        )
+
+    badge, warrants, warrant_reasons = evaluate_claim_epistemic_state(store, statement)
+    validated_warrants = [(w, evaluate_warrant_epistemic_state(store, w)[0]) for w in warrants]
+    if badge == 'falsified':
+        deductive_status = 'falsified'
+        inferential_status = 'falsified'
+    else:
+        deductive_status = (
+            'proved'
+            if badge == 'warranted'
+            and any(
+                w.warrant_kind in ('formal_lean', 'deductive_proof') and eff == 'valid'
+                for w, eff in validated_warrants
+            )
+            else 'unproved'
+        )
+        inferential_status = (
+            'supported'
+            if badge == 'warranted'
+            and any(
+                w.warrant_kind in ('empirical_study', 'computational_check') and eff == 'valid'
+                for w, eff in validated_warrants
+            )
+            else 'untested'
+        )
+    empirical_support = bool(
+        badge == 'warranted'
+        and any(w.warrant_kind == 'empirical_study' and eff == 'valid' for w, eff in validated_warrants)
+    )
+    return {
+        'statement_id': sid,
+        'definition_ref': persisted_def_ref,
+        'definition_matches_current_checker': persisted_def_ref == asdict(definition_ref(key)),
+        'scientific_status': {
+            'epistemic_badge': badge,
+            'deductive_status': deductive_status,
+            'inferential_status': inferential_status,
+            'warrant_count': len(warrants),
+            'reasons': list(warrant_reasons),
+        },
+        'construct_feasibility': compute_construct_feasibility(store, cid),
+        'sources': sources,
+        'open_use_obligation': gap.model_dump(mode='json'),
+        'empirical_support': empirical_support,
+    }
 
 
-def main():
+def _resolve_db_path(project: str | None, db: str | None) -> Path:
+    if db is not None:
+        return Path(db).resolve()
+    if project is not None:
+        return (Path(project).resolve() / '.synapse' / 'knowledge.sqlite').resolve()
+    raise ValueError('Pass either --db or --project')
+
+
+def _probe_staging_store(
+    ro: object,
+    packet: dict,
+    prior_claim_digests: dict[str, str],
+) -> tuple[object, dict[str, dict[str, object]], dict[str, dict], object]:
+    from synapse.logic import audit_store
+    from synapse.rag import SynapseRAG
+
+    audit_rep = audit_store(ro)
+    if audit_rep.dangling_refs:
+        raise ValueError(f'Dangling refs after definition publication: {audit_rep.dangling_refs}')
+
+    current_claim_digests = {
+        str(r[0]): str(r[1])
+        for r in ro.connection.execute('SELECT claim_id, meaning_digest FROM claims').fetchall()
+    }
+    for sid, dig in prior_claim_digests.items():
+        if not sid.startswith(PREFIX):
+            if current_claim_digests.get(sid) != dig:
+                raise ValueError(f'Unexpected modification to existing claim {sid}')
+        elif sid.startswith(PREFIX + 'statement:'):
+            key = sid[len(PREFIX + 'statement:') :]
+            existing_claim = ro.get_claim(sid)
+            if (
+                key in DEFINITIONS
+                and existing_claim is not None
+                and existing_claim.mathematical_latex == DEFINITIONS[key]['formula']
+                and current_claim_digests.get(sid) != dig
+            ):
+                raise ValueError(f'Existing definition claim {sid} meaning_digest shifted ({dig} != {current_claim_digests.get(sid)})')
+
+    rag = SynapseRAG(ro)
+    probes: dict[str, dict[str, object]] = {}
+    probe_details: dict[str, dict] = {}
+    for key in ('conditional_variance', 'squared_return', 'realized_stddev', 'qlike'):
+        sid = PREFIX + 'statement:' + key
+        resp = rag.search(f"Shared definition {key.replace('_', ' ')}", limit=12, include_passages=True)
+        hit_ids = {h.claim_id for h in resp.claim_hits}
+        detail = inspect_definition(ro, key)
+        if sid not in hit_ids:
+            raise ValueError(f'RAG search missed definition claim {sid}')
+        if not detail['definition_matches_current_checker']:
+            raise ValueError(f'Definition checker mismatch for {key}')
+        if not detail['sources'] or not all(s['current'] for s in detail['sources']):
+            raise ValueError(f'Stale or missing source mappings for {key}')
+        sci = detail['scientific_status']
+        if (
+            sci['epistemic_badge'] != 'conjectured'
+            or sci['deductive_status'] != 'unproved'
+            or sci['inferential_status'] != 'untested'
+            or detail['empirical_support'] is not False
+        ):
+            raise ValueError(f'Unexpected scientific status for {key}: {sci}')
+        if key == 'conditional_variance' and detail['construct_feasibility']['status'] != 'theoretical_oracle':
+            raise ValueError(f'Unexpected feasibility for {key}')
+        if key in {'squared_return', 'realized_stddev'} and detail['construct_feasibility']['status'] != 'lookahead_dependent':
+            raise ValueError(f'Unexpected feasibility for {key}')
+        probe_details[key] = detail
+        probes[key] = {
+            'definition_retrieved': sid in hit_ids,
+            'rag_claim_hit': sid in hit_ids,
+            'source_revisions_current': True,
+            'status_unpromoted': True,
+            'feasibility': detail['construct_feasibility']['status'],
+        }
+    return audit_rep, probes, probe_details, ro.store_info()
+
+
+def _unlink_sqlite_sidecars(db_path: Path) -> None:
+    for suffix in ('-wal', '-shm', '-journal'):
+        sidecar = Path(f'{db_path}{suffix}')
+        if sidecar.exists():
+            sidecar.unlink()
+
+
+def main() -> None:
     import argparse
+    import os
+    import shutil
+    import tempfile
+
+    from synapse.store import SynapseStore
+
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--project', required=True)
+    parser.add_argument('--project', default=None, help='Project root containing .synapse/knowledge.sqlite')
+    parser.add_argument('--db', default=None, help='Direct path to Synapse v3.0 SQLite database')
     parser.add_argument('--packet', default=str(Path(__file__).with_name('definition_slice_sources.json')))
     parser.add_argument('--output', required=True)
-    parser.add_argument('--record', action='store_true', help='Publish the passive native delta after preview; otherwise audit only')
+    parser.add_argument('--record', action='store_true', help='Persist definitions after backup; otherwise audit on a backup copy')
     args = parser.parse_args()
-    from synapse.projects import bind_project
-    from synapse.graph.importing import NATIVE_REGISTRIES
-    from synapse.obligations import capture_reference, inspect_obligations
-    from synapse.models.obligations import KnowledgeRef
-    from synapse.workflows import make_change, preview_change, record_change, ArtifactRequest
+
+    db_path = _resolve_db_path(args.project, args.db)
     output = Path(args.output).resolve()
-    output.mkdir(parents=True,exist_ok=False)
-    packet = json.loads(Path(args.packet).read_text())
-    selected = bind_project(args.project,include_paper_local_seeds=True)
-    if selected.status != 'bound':
-        raise ValueError(selected.to_dict())
-    base = selected.session.load_dag()
-    def inventory(graph):
-        return {registry:{key:_digest(node.model_dump(mode='json',exclude={'epistemic_vector','execution_receipt'})) for key,node in getattr(graph,registry).items()} for registry,_,_,_ in NATIVE_REGISTRIES}
-    previous = inventory(base)
-    previous_revisions = {sid:capture_reference(base,KnowledgeRef(kind='statement',node_id=sid)) for sid in base.statements}
-    (output/'before-record-hashes.json').write_text(_json(previous))
-    (output/'before-claim-revisions.json').write_text(_json(previous_revisions))
-    delta = build_delta(base,packet)
-    (output/'definition-inventory.json').write_text(json.dumps({key:{**dict(spec),'native_ref':asdict(definition_ref(key)),'source_ids':packet['definition_sources'][key]} for key,spec in DEFINITIONS.items()},indent=2)+'\n')
-    change = make_change(operation_id=PREFIX+'record:'+_digest(packet)+':'+POLICY_DIGEST,
-        actor='codex-volatility-definition-curator',reason='VOL-7 reviewed normalization of existing source slice; no scientific execution or proof.',
-        graph=delta,queries=('shared volatility definitions conditional variance squared return QLIKE target proxy loss',),
-        artifacts=(ArtifactRequest(path=output/'native-context.md',kind='context_markdown'),))
-    preview = preview_change(selected.session,change)
-    (output/'preview.json').write_text(preview.model_dump_json(indent=2)+'\n')
-    if not preview.ready or preview.revised:
-        raise ValueError(preview.errors or 'Unexpected revision to existing records')
+    output.mkdir(parents=True, exist_ok=False)
+    packet = json.loads(Path(args.packet).read_text(encoding='utf-8'))
+
+    backup_db = output / 'pre-definition-backup.sqlite'
+    with SynapseStore(db_path, read_only=True) as ro_init:
+        info_before = ro_init.store_info()
+        if info_before['user_version'] < 300:
+            raise ValueError(f'Expected Synapse v3 store (user_version=300), got {info_before["user_version"]}')
+        ro_init.backup_to(backup_db)
+
+    with SynapseStore(backup_db, read_only=True) as ro_bak:
+        prior_claim_digests = {
+            str(r[0]): str(r[1])
+            for r in ro_bak.connection.execute('SELECT claim_id, meaning_digest FROM claims').fetchall()
+        }
+    (output / 'before-claim-revisions.json').write_text(_json(prior_claim_digests) + '\n', encoding='utf-8')
+    (output / 'definition-inventory.json').write_text(
+        json.dumps(
+            {
+                key: {**dict(spec), 'native_ref': asdict(definition_ref(key)), 'source_ids': packet['definition_sources'][key]}
+                for key, spec in DEFINITIONS.items()
+            },
+            indent=2,
+        )
+        + '\n',
+        encoding='utf-8',
+    )
+
+    staging_db = output / 'staging-audit.sqlite'
+    shutil.copyfile(backup_db, staging_db)
+    with SynapseStore(staging_db) as st_store:
+        delta_res = build_delta(st_store, packet)
+        st_store.connection.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+        st_store.connection.execute('PRAGMA journal_mode = DELETE')
+
+    with SynapseStore(staging_db, read_only=True) as ro_stage:
+        audit_rep, probes, probe_details, info_after = _probe_staging_store(ro_stage, packet, prior_claim_digests)
+
     if not args.record:
-        print(_json({'mode':'audit_only','ready':True,'additions':len(preview.added),'policy_digest':POLICY_DIGEST}))
+        print(
+            _json(
+                {
+                    'mode': 'audit_only',
+                    'ready': True,
+                    'definition_count': delta_res['definition_count'],
+                    'dangling_refs': list(audit_rep.dangling_refs),
+                    'consumer_queries': probes,
+                    'policy_digest': POLICY_DIGEST,
+                }
+            )
+        )
         return
-    report = record_change(selected.session,change,preview)
-    (output/'workflow.json').write_text(report.model_dump_json(indent=2)+'\n')
-    if report.persistence not in {'committed','unchanged'}:
-        raise ValueError('Inspect workflow receipt before any retry: '+str(report.errors))
-    # Do not republish if optional automatic artifact delivery needs recovery.
-    fresh = bind_project(args.project,include_paper_local_seeds=True)
-    if fresh.status != 'bound':
-        raise ValueError(fresh.to_dict())
-    current = fresh.session.load_dag()
-    now = inventory(current)
-    assert all(now[registry].get(key)==digest for registry,records in previous.items() for key,digest in records.items())
-    assert all(capture_reference(current,KnowledgeRef(kind='statement',node_id=sid))==digest for sid,digest in previous_revisions.items())
-    assert all(now[registry].get(key)==digest for registry,records in inventory(delta).items() for key,digest in records.items())
-    wanted = set(delta.obligations)
-    observed = [x for x in inspect_obligations(current) if x.record.record_id in wanted]
-    assert {x.record.record_id for x in observed}==wanted and all(x.freshness=='current' for x in observed)
-    current.validate_acyclicity()
-    # Exercise the query layer on exact definition IDs with their source/gap cones.
-    from synapse.rag.retriever import EpistemicGraphRAG, EpistemicQuery
-    rag = EpistemicGraphRAG(current)
-    probes = {}
-    for key in ('conditional_variance','squared_return','realized_stddev','qlike'):
-        sid = PREFIX+'statement:'+key
-        response = rag.query(EpistemicQuery(query_text=sid,statement_id_prefix=PREFIX+'statement:',include_paper_local_seeds=True,top_k=12))
-        text = response.to_agent_markdown()
-        assert sid in text and PREFIX+'use-gap:'+key in text
-        (output/(key+'-context.md')).write_text(text)
-        detail=inspect_definition(current,key)
-        assert detail['definition_matches_current_checker'] and detail['sources'] and all(s['current'] for s in detail['sources'])
-        assert detail['scientific_status']['deductive_status']=='unproved' and detail['scientific_status']['inferential_status']=='untested'
-        if key=='conditional_variance': assert detail['construct_feasibility']['status']=='theoretical_oracle'
-        if key in {'squared_return','realized_stddev'}: assert detail['construct_feasibility']['status']=='lookahead_dependent'
-        (output/(key+'-source-context.json')).write_text(json.dumps(detail,indent=2)+'\n')
-        probes[key] = {'definition_retrieved':True,'use_obligation_retrieved':True,'source_revisions_current':True,'status_unpromoted':True,'feasibility':detail['construct_feasibility']['status']}
-    snapshot = fresh.session.binding.snapshot
-    summary = {'store':str(fresh.session.binding.store_path),'snapshot':{'store_id':snapshot.store_id,'revision':snapshot.revision},
-        'definition_count':len(DEFINITIONS),'source_claims_reused':len(packet['sources']),
-        'prior_records_preserved':sum(map(len,previous.values())),'prior_claim_revisions_preserved':len(previous_revisions),
-        'current_open_use_obligations':len(observed),'consumer_queries':probes,
-        'automatic_consumer_status':report.consumer_review,'scientific_execution':'not_run','formal_checking':'not_run','empirical_support':False}
-    (output/'consumer-review.json').write_text(json.dumps(summary,indent=2)+'\n')
-    print(json.dumps(summary,indent=2))
+
+    fd, tmp_target_str = tempfile.mkstemp(prefix='.synapse-stage-', suffix='.sqlite', dir=str(db_path.parent))
+    os.close(fd)
+    tmp_target = Path(tmp_target_str)
+    try:
+        shutil.copyfile(staging_db, tmp_target)
+        os.replace(tmp_target, db_path)
+    except Exception:
+        if tmp_target.exists():
+            tmp_target.unlink()
+        raise
+    _unlink_sqlite_sidecars(db_path)
+
+    with SynapseStore(db_path, read_only=True) as ro_final:
+        audit_rep, probes, probe_details, info_after = _probe_staging_store(ro_final, packet, prior_claim_digests)
+        for key, detail in probe_details.items():
+            (output / f'{key}-source-context.json').write_text(json.dumps(detail, indent=2) + '\n', encoding='utf-8')
+
+    summary = {
+        'store': str(db_path),
+        'user_version': info_after['user_version'],
+        'definition_count': len(DEFINITIONS),
+        'source_claims_reused': len(packet['sources']),
+        'prior_claim_revisions_preserved': len(prior_claim_digests),
+        'dangling_refs': len(audit_rep.dangling_refs),
+        'consumer_queries': probes,
+        'scientific_execution': 'not_run',
+        'formal_checking': 'not_run',
+        'empirical_support': False,
+    }
+    (output / 'consumer-review.json').write_text(json.dumps(summary, indent=2) + '\n', encoding='utf-8')
+    print(json.dumps(summary, indent=2))
 
 
 if __name__ == '__main__':

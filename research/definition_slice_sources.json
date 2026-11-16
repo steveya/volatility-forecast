@@ -6,6 +6,16 @@
     "revision": 11
   },
   "sources": {
+    "volatility:literature:v1:handbook-abcd2006:85e49716e6d9fdbf:statement:conditional-target": "5bd4bb25f9015700601080761d7dd2d38462ffda01956e8fb9ed9bc24a548b34",
+    "volatility:literature:v1:har-corsi2009:18c305635feefc15:statement:target": "a39d464571b8ef28a8618c3c30c544476f243d73a4976105838f87c22b95060c",
+    "volatility:literature:v1:proxy-patton2011:bfcc630f931a01e5:statement:losses": "7c8cef4f1bb4e7211bfb8212fddfe43408421e765300e90897a80cb3b9ee2202",
+    "volatility:literature:v1:proxy-patton2011:bfcc630f931a01e5:statement:robustness": "10d349462e265f97340c51fd922da4bbb89e545d7587624c6b4c4410ebac794a",
+    "volatility:literature:v1:proxy-patton2011:bfcc630f931a01e5:statement:target": "60b5c933b7c5f4fcf1bcb984be870553016de10b199d895f5cee4ecf9a1cd8ac",
+    "volatility:literature:v1:realized-abdl2003:d19f59f817bc08f8:statement:abdl-conditional-vs-realized": "da169b23079a62f2c9148c4c174682da07e8c3c6c8b17ca17bd3d894ba4e13bf",
+    "volatility:literature:v1:realized-abdl2003:d19f59f817bc08f8:statement:abdl-rv-qv": "31b2d83d37362e3e84f4b8be9c715a13d29dd17e0b2a5d7eef82f91d8a5bb57d",
+    "volatility:insight:part1:v1:statement:target-scale": "8c9efea8413e3e98265b867950a320e987061ec174c7bd90a854a5887067f669"
+  },
+  "legacy_v1_sources": {
     "volatility:literature:v1:handbook-abcd2006:85e49716e6d9fdbf:statement:conditional-target": "24d7cf1a5b7985633d4e68cdd66b613b3a7961d3c3d488ebc7fd4eb3b3aefb7e",
     "volatility:literature:v1:har-corsi2009:18c305635feefc15:statement:target": "1bb1fe3bc133dac8498dedb9be3a2eeeec21dd442fdfb3ca3a969e20cf0f2fea",
     "volatility:literature:v1:proxy-patton2011:bfcc630f931a01e5:statement:losses": "6b6ee7e88c836f7533892b01902c94a398ee5a8ed5f97bb2077730067340c2bb",
