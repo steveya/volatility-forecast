@@ -18,11 +18,14 @@ config = VolGRUConfig(
     backend='torch',
     gate_mode='gru_linear',
     candidate_mode='mlp_pos',
-    val_fraction=0.15
+    val_fraction=0.15,
+    dtype='float32',  # use 'float64' for 1e-12 STES numerical parity
 )
 model = VolGRUModel(config=config)
 model.fit(X_train, y_train, returns=returns_train)
 ```
+
+> **Precision note (`VolGRUConfig.dtype`):** The Torch backend defaults to `dtype='float32'` for training throughput and backward-compatible outputs (`np.float32`, matching `STESModel` to `rtol=1e-6, atol=1e-6` in the STES-reduced `gate_mode='stes_linear', candidate_mode='stes_r2', state_dim=1` configuration at moderate gate logits). Set `dtype='float64'` when exact double-precision parity with `STESModel` (`rtol=0.0, atol=1e-12`, provided variance states remain above `VolGRUConfig.eps`) is required.
 
 ## Alphaforge Runtime
 

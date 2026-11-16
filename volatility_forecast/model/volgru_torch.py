@@ -11,6 +11,20 @@ from .volgru_config import VolGRUConfig
 from .volgru_utils import positive_transform_torch
 
 
+def _resolve_torch_dtype(
+    config: VolGRUConfig,
+    dtype: Optional[torch.dtype],
+) -> torch.dtype:
+    if dtype is not None:
+        return dtype
+    cfg_dtype = getattr(config, "dtype", "float32")
+    if cfg_dtype == "float64":
+        return torch.float64
+    if cfg_dtype == "float32":
+        return torch.float32
+    raise ValueError(f"Unsupported VolGRU dtype={cfg_dtype!r}")
+
+
 class VolGRUCellTorch(nn.Module):
     """Single-step VolGRU cell for scalar or vector variance state updates."""
 
@@ -19,24 +33,33 @@ class VolGRUCellTorch(nn.Module):
         config: VolGRUConfig,
         n_features: int,
         *,
-        dtype: torch.dtype = torch.float32,
+        dtype: Optional[torch.dtype] = None,
     ) -> None:
         super().__init__()
 
+        resolved_dtype = _resolve_torch_dtype(config, dtype)
         self.config = config
         self.n_features = int(n_features)
         self.state_dim = int(config.state_dim)
-        self.dtype = dtype
+        self.dtype = resolved_dtype
 
-        self.gate_beta = nn.Parameter(torch.zeros(self.n_features, self.state_dim, dtype=dtype))
+        self.gate_beta = nn.Parameter(
+            torch.zeros(self.n_features, self.state_dim, dtype=resolved_dtype)
+        )
         if self.config.gate_mode == "gru_linear":
-            self.gate_state_weight = nn.Parameter(torch.zeros(self.state_dim, dtype=dtype))
+            self.gate_state_weight = nn.Parameter(
+                torch.zeros(self.state_dim, dtype=resolved_dtype)
+            )
         else:
             self.register_parameter("gate_state_weight", None)
 
         if self.config.use_reset_gate:
-            self.reset_gamma = nn.Parameter(torch.zeros(self.n_features, self.state_dim, dtype=dtype))
-            self.reset_state_weight = nn.Parameter(torch.zeros(self.state_dim, dtype=dtype))
+            self.reset_gamma = nn.Parameter(
+                torch.zeros(self.n_features, self.state_dim, dtype=resolved_dtype)
+            )
+            self.reset_state_weight = nn.Parameter(
+                torch.zeros(self.state_dim, dtype=resolved_dtype)
+            )
         else:
             self.register_parameter("reset_gamma", None)
             self.register_parameter("reset_state_weight", None)
@@ -45,7 +68,9 @@ class VolGRUCellTorch(nn.Module):
             self.candidate_linear = None
             self.candidate_mlp = None
         elif self.config.candidate_mode == "linear_pos":
-            self.candidate_linear = nn.Linear(4 + self.state_dim, self.state_dim, bias=True).to(dtype=dtype)
+            self.candidate_linear = nn.Linear(
+                4 + self.state_dim, self.state_dim, bias=True
+            ).to(dtype=resolved_dtype)
             self.candidate_mlp = None
         elif self.config.candidate_mode == "mlp_pos":
             hidden = int(self.config.mlp_hidden_dim)
@@ -54,7 +79,7 @@ class VolGRUCellTorch(nn.Module):
                 nn.Linear(3 + self.state_dim, hidden, bias=True),
                 nn.Tanh(),
                 nn.Linear(hidden, self.state_dim, bias=True),
-            ).to(dtype=dtype)
+            ).to(dtype=resolved_dtype)
         else:
             raise ValueError(f"Unsupported candidate_mode={self.config.candidate_mode!r}")
 
@@ -157,35 +182,40 @@ class VolGRUCellTorch(nn.Module):
                 f"Feature mismatch: cell expects {self.n_features}, got {X.shape[1]}"
             )
 
-        n = int(returns.shape[0])
-        sigma2_next = torch.empty(n, dtype=returns.dtype, device=returns.device)
-        z_all = torch.empty((n, self.state_dim), dtype=returns.dtype, device=returns.device)
-        cand_all = torch.empty((n, self.state_dim), dtype=returns.dtype, device=returns.device)
+        param_dtype = self.gate_beta.dtype
+        param_device = self.gate_beta.device
+        X_cast = X.to(dtype=param_dtype, device=param_device)
+        r_cast = returns.to(dtype=param_dtype, device=param_device)
+
+        n = int(r_cast.shape[0])
+        sigma2_next = torch.empty(n, dtype=param_dtype, device=param_device)
+        z_all = torch.empty((n, self.state_dim), dtype=param_dtype, device=param_device)
+        cand_all = torch.empty((n, self.state_dim), dtype=param_dtype, device=param_device)
 
         if init_var is None:
             v_t = torch.full(
                 (self.state_dim,),
-                float((returns[0] * returns[0]).item()),
-                dtype=returns.dtype,
-                device=returns.device,
+                float((r_cast[0] * r_cast[0]).item()),
+                dtype=param_dtype,
+                device=param_device,
             )
         else:
             if torch.is_tensor(init_var):
-                init_var_t = init_var.to(dtype=returns.dtype, device=returns.device)
+                init_var_t = init_var.to(dtype=param_dtype, device=param_device)
             else:
-                init_var_t = torch.tensor(float(init_var), dtype=returns.dtype, device=returns.device)
+                init_var_t = torch.tensor(float(init_var), dtype=param_dtype, device=param_device)
             if init_var_t.ndim == 0:
                 v_t = torch.full(
                     (self.state_dim,),
                     float(init_var_t.item()),
-                    dtype=returns.dtype,
-                    device=returns.device,
+                    dtype=param_dtype,
+                    device=param_device,
                 )
             else:
                 v_t = init_var_t.reshape(self.state_dim)
 
         for t in range(n):
-            v_t, z_t, cand_t, _ = self.forward_step(v_t, returns[t], X[t])
+            v_t, z_t, cand_t, _ = self.forward_step(v_t, r_cast[t], X_cast[t])
             sigma2_next[t] = v_t.mean()
             z_all[t] = z_t
             cand_all[t] = cand_t
@@ -205,12 +235,15 @@ class VolGRUModelTorch(nn.Module):
         config: VolGRUConfig,
         n_features: int,
         *,
-        dtype: torch.dtype = torch.float32,
+        dtype: Optional[torch.dtype] = None,
     ) -> None:
         super().__init__()
         self.config = config
         self.n_features = int(n_features)
-        self.cell = VolGRUCellTorch(config=config, n_features=n_features, dtype=dtype)
+        resolved_dtype = _resolve_torch_dtype(config, dtype)
+        self.cell = VolGRUCellTorch(
+            config=config, n_features=n_features, dtype=resolved_dtype
+        )
 
     def forward_sequence(
         self,

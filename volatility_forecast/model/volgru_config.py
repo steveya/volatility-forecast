@@ -2,13 +2,24 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Literal, Optional
+from dataclasses import MISSING, dataclass, fields
+from typing import Any, Literal, Optional
+
+_LEGACY_DTYPE_BACKFILLED_IDS: set[int] = set()
 
 
 @dataclass(slots=True)
 class VolGRUConfig:
-    """Configuration for backend-agnostic VolGRU models."""
+    """Configuration for backend-agnostic VolGRU models.
+
+    Attributes
+    ----------
+    dtype : {"float32", "float64"}, default "float32"
+        Floating-point precision used by the Torch backend parameters and
+        state recursion. ``"float32"`` preserves backward-compatible training and
+        default predictions; ``"float64"`` gives double-precision STES
+        equivalence (``rtol=0, atol=1e-12`` when variance stays above ``eps``).
+    """
 
     backend: Literal["torch"] = "torch"
     gate_mode: Literal["stes_linear", "gru_linear"] = "stes_linear"
@@ -17,6 +28,7 @@ class VolGRUConfig:
     use_reset_gate: bool = False
     positive_transform: Literal["softplus", "exp"] = "softplus"
     loss_mode: Literal["mse_r2", "nll_gaussian", "qlike"] = "mse_r2"
+    dtype: Literal["float32", "float64"] = "float32"
 
     weight_decay_gate: float = 0.0
     weight_decay_candidate: float = 0.0
@@ -63,3 +75,37 @@ class VolGRUConfig:
             raise ValueError("gate_feature_group_lambda must be >= 0.")
         if not (0.0 <= self.val_fraction < 1.0):
             raise ValueError("val_fraction must be in [0, 1).")
+        if self.dtype not in ("float32", "float64"):
+            raise ValueError("dtype must be 'float32' or 'float64'.")
+        _LEGACY_DTYPE_BACKFILLED_IDS.discard(id(self))
+
+    def __setstate__(self, state: Any) -> None:
+        if isinstance(state, tuple) and len(state) == 2:
+            dict_state, slot_state = state
+        elif isinstance(state, dict):
+            dict_state, slot_state = None, state
+        else:
+            raise TypeError(f"Unsupported VolGRUConfig pickle state: {type(state)!r}")
+
+        restored: dict[str, Any] = {}
+        if dict_state:
+            restored.update(dict_state)
+        if slot_state:
+            restored.update(slot_state)
+
+        missing_dtype = "dtype" not in restored
+        for f in fields(self):
+            if f.name in restored:
+                object.__setattr__(self, f.name, restored[f.name])
+            elif f.default is not MISSING:
+                object.__setattr__(self, f.name, f.default)
+            elif f.default_factory is not MISSING:
+                object.__setattr__(self, f.name, f.default_factory())
+
+        if missing_dtype:
+            _LEGACY_DTYPE_BACKFILLED_IDS.add(id(self))
+        else:
+            _LEGACY_DTYPE_BACKFILLED_IDS.discard(id(self))
+
+    def __del__(self, _ids: set[int] = _LEGACY_DTYPE_BACKFILLED_IDS) -> None:
+        _ids.discard(id(self))
