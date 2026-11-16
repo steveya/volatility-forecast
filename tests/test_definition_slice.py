@@ -121,41 +121,389 @@ def test_mse_and_rmse_preserve_order_on_matched_data_without_changing_target():
 
 def test_native_refs_and_source_corrections_are_checked(tmp_path):
     pytest.importorskip('synapse')
-    from synapse.graph.dag import EpistemicDAG
-    from synapse.models.core import AtomicStatement
-    from synapse.models.obligations import KnowledgeRef
-    from synapse.obligations import capture_reference
-    from synapse.quantities import quantity_ref
-    base = EpistemicDAG()
-    base.add_statement(AtomicStatement(statement_id='fixture:source', name='fixture source',
-        conclusion_latex='x', conclusion_text='Declared source context'))
-    packet = {'format_version': 1, 'sources': {'fixture:source': capture_reference(base, KnowledgeRef(kind='statement', node_id='fixture:source'))},
-              'definition_sources': {key: ['fixture:source'] for key in mod.DEFINITIONS}}
-    delta = mod.build_delta(base, packet)
-    for key in ('conditional_variance', 'conditional_second_moment', 'conditional_stddev'):
-        assert delta.compute_construct_feasibility(mod.PREFIX+'construct:'+key).status.value == 'theoretical_oracle'
-    assert delta.compute_construct_feasibility(mod.PREFIX+'construct:squared_return').status.value == 'lookahead_dependent'
-    bundle = next(iter(delta.quantity_bundles.values()))
-    assert len(bundle.quantity_definitions) == len(mod.DEFINITIONS)
-    for definition in bundle.quantity_definitions:
-        ref = quantity_ref(definition)
-        key = definition.definition_id.split(':')[-1]
-        assert ref.model_dump() == mod.definition_ref(key).__dict__
-    # Inspect a complete persisted graph, preserving the source context separately.
-    from synapse.graph.importing import NATIVE_REGISTRIES
-    from synapse.storage import SQLiteEpistemicStore
-    for registry, _, _, _ in NATIVE_REGISTRIES:
-        getattr(base,registry).update(getattr(delta,registry))
-    store=SQLiteEpistemicStore(tmp_path/'definitions.sqlite')
-    store.save_dag(base)
-    loaded=store.load_dag()
-    detail=mod.inspect_definition(loaded,'conditional_variance')
-    assert detail['sources'][0]['statement_id']=='fixture:source'
-    assert detail['sources'][0]['current'] and detail['definition_matches_current_checker']
-    assert detail['construct_feasibility']['status']=='theoretical_oracle'
-    assert detail['scientific_status']['deductive_status']=='unproved'
-    loaded.statements['fixture:source'].conclusion_text='Changed after publication'
-    assert not mod.inspect_definition(loaded,'conditional_variance')['sources'][0]['current']
-    base.statements['fixture:source'].conclusion_text = 'Changed source interpretation'
-    with pytest.raises(ValueError, match='source revision'):
-        mod.build_delta(base, packet)
+    from synapse.models import Claim
+    from synapse.store import SynapseStore
+
+    db_path = tmp_path / 'definitions.sqlite'
+    with SynapseStore(db_path) as store:
+        src = Claim(
+            claim_id='fixture:source',
+            claim_kind='theorem',
+            mathematical_latex='x',
+            title='fixture source',
+            exposition='Declared source context',
+        )
+        store.put_claim(src)
+        packet = {
+            'format_version': 1,
+            'sources': {'fixture:source': src.meaning_digest},
+            'definition_sources': {key: ['fixture:source'] for key in mod.DEFINITIONS},
+        }
+        mod.build_delta(store, packet)
+
+    with SynapseStore(db_path, read_only=True) as ro:
+        for key in ('conditional_variance', 'conditional_second_moment', 'conditional_stddev'):
+            assert mod.compute_construct_feasibility(ro, mod.PREFIX + 'construct:' + key)['status'] == 'theoretical_oracle'
+        assert mod.compute_construct_feasibility(ro, mod.PREFIX + 'construct:squared_return')['status'] == 'lookahead_dependent'
+
+        bundle = ro.get_object(mod.PREFIX + 'quantity-bundle')
+        assert bundle is not None
+        q_defs = bundle.spec_payload['quantity_definitions']
+        assert isinstance(q_defs, list) and len(q_defs) == len(mod.DEFINITIONS)
+        for key, ref_dict in bundle.spec_payload['definition_refs'].items():
+            assert ref_dict == mod.definition_ref(key).__dict__
+
+        detail = mod.inspect_definition(ro, 'conditional_variance')
+        assert detail['sources'][0]['statement_id'] == 'fixture:source'
+        assert detail['sources'][0]['current'] and detail['definition_matches_current_checker']
+        assert detail['construct_feasibility']['status'] == 'theoretical_oracle'
+        assert detail['scientific_status']['epistemic_badge'] == 'conjectured'
+        assert detail['scientific_status']['deductive_status'] == 'unproved'
+        assert detail['scientific_status']['inferential_status'] == 'untested'
+
+    with SynapseStore(db_path) as store:
+        revised = Claim(
+            claim_id='fixture:source',
+            claim_kind='theorem',
+            mathematical_latex='y',
+            title='fixture source',
+            exposition='Changed after publication',
+        )
+        store.put_claim(revised, allow_revision=True, reason='Test source revision invalidation')
+        assert not mod.inspect_definition(store, 'conditional_variance')['sources'][0]['current']
+        with pytest.raises(ValueError, match='source revision'):
+            mod.build_delta(store, packet)
+
+
+def test_definition_slice_cli_audit_only_and_record_roundtrip(tmp_path, monkeypatch):
+    pytest.importorskip('synapse')
+    import json
+    from synapse.models import Claim
+    from synapse.store import SynapseStore
+
+    db_path = tmp_path / 'cli_defs.sqlite'
+    with SynapseStore(db_path) as store:
+        src = Claim(
+            claim_id='fixture:source',
+            claim_kind='theorem',
+            mathematical_latex='x',
+            title='fixture source',
+        )
+        store.put_claim(src)
+        packet_path = tmp_path / 'packet.json'
+        packet_path.write_text(
+            json.dumps(
+                {
+                    'format_version': 1,
+                    'sources': {'fixture:source': src.meaning_digest},
+                    'definition_sources': {key: ['fixture:source'] for key in mod.DEFINITIONS},
+                }
+            ),
+            encoding='utf-8',
+        )
+
+    out_audit = tmp_path / 'out_audit'
+    monkeypatch.setattr(sys, 'argv', ['definition_slice', '--db', str(db_path), '--packet', str(packet_path), '--output', str(out_audit)])
+    mod.main()
+    with SynapseStore(db_path, read_only=True) as ro:
+        assert ro.get_claim(mod.PREFIX + 'statement:conditional_variance') is None
+
+    out_rec = tmp_path / 'out_rec'
+    monkeypatch.setattr(sys, 'argv', ['definition_slice', '--db', str(db_path), '--packet', str(packet_path), '--output', str(out_rec), '--record'])
+    mod.main()
+    summary = json.loads((out_rec / 'consumer-review.json').read_text(encoding='utf-8'))
+    assert summary['definition_count'] == len(mod.DEFINITIONS)
+    assert summary['dangling_refs'] == 0
+    assert summary['empirical_support'] is False
+    for probe in summary['consumer_queries'].values():
+        assert probe['definition_retrieved'] is True
+        assert probe['rag_claim_hit'] is True
+    assert not Path(f'{db_path}-wal').exists()
+    assert not Path(f'{db_path}-shm').exists()
+    assert (out_rec / 'qlike-source-context.json').is_file()
+
+
+def test_inspect_definition_evaluates_warrants_and_build_delta_blocks_warranted(tmp_path):
+    pytest.importorskip('synapse')
+    from synapse.models import Claim, Warrant
+    from synapse.store import SynapseStore
+
+    db_path = tmp_path / 'warrants.sqlite'
+    sid = mod.PREFIX + 'statement:conditional_variance'
+    with SynapseStore(db_path) as store:
+        src = Claim(claim_id='fixture:source', claim_kind='theorem', mathematical_latex='x', title='fixture source')
+        store.put_claim(src)
+        packet = {
+            'format_version': 1,
+            'sources': {'fixture:source': src.meaning_digest},
+            'definition_sources': {key: ['fixture:source'] for key in mod.DEFINITIONS},
+        }
+        mod.build_delta(store, packet)
+        target_claim = store.get_claim(sid)
+        assert target_claim is not None
+
+        store.put_warrant(
+            Warrant(
+                warrant_id='fixture:w:stale',
+                warrant_kind='formal_lean',
+                target_claim_id=sid,
+                locked_meaning_digest='0' * 64,
+                status='valid',
+            )
+        )
+        stale_detail = mod.inspect_definition(store, 'conditional_variance')
+        assert stale_detail['scientific_status']['epistemic_badge'] == 'stale'
+        assert stale_detail['scientific_status']['deductive_status'] == 'unproved'
+        assert stale_detail['scientific_status']['inferential_status'] == 'untested'
+        assert stale_detail['empirical_support'] is False
+
+        with pytest.raises(ValueError, match='warranted'):
+            mod.build_delta(store, packet)
+
+        store.put_warrant(
+            Warrant(
+                warrant_id='fixture:w:emp',
+                warrant_kind='empirical_study',
+                target_claim_id=sid,
+                locked_meaning_digest=target_claim.meaning_digest,
+                status='valid',
+            )
+        )
+        blocked_detail = mod.inspect_definition(store, 'conditional_variance')
+        assert blocked_detail['scientific_status']['epistemic_badge'] == 'stale'
+        assert blocked_detail['empirical_support'] is False
+
+        store.put_warrant(
+            Warrant(
+                warrant_id='fixture:w:source',
+                warrant_kind='deductive_proof',
+                target_claim_id='fixture:source',
+                locked_meaning_digest=src.meaning_digest,
+                status='valid',
+            )
+        )
+        emp_detail = mod.inspect_definition(store, 'conditional_variance')
+        assert emp_detail['scientific_status']['epistemic_badge'] == 'warranted'
+        assert emp_detail['scientific_status']['inferential_status'] == 'supported'
+        assert emp_detail['scientific_status']['deductive_status'] == 'unproved'
+        assert emp_detail['empirical_support'] is True
+
+        store.put_warrant(
+            Warrant(
+                warrant_id='fixture:w:bad',
+                warrant_kind='deductive_proof',
+                target_claim_id=sid,
+                locked_meaning_digest=target_claim.meaning_digest,
+                status='falsified',
+            )
+        )
+        bad_detail = mod.inspect_definition(store, 'conditional_variance')
+        assert bad_detail['scientific_status']['epistemic_badge'] == 'falsified'
+        assert bad_detail['scientific_status']['deductive_status'] == 'falsified'
+        assert bad_detail['scientific_status']['inferential_status'] == 'falsified'
+        assert bad_detail['empirical_support'] is False
+
+
+def test_inspect_definition_rejects_tampered_bundle_deps_and_edges(tmp_path):
+    pytest.importorskip('synapse')
+    from synapse.models import Claim, Edge
+    from synapse.store import SynapseStore
+
+    db_path = tmp_path / 'tamper.sqlite'
+    sid = mod.PREFIX + 'statement:conditional_variance'
+    cid = mod.PREFIX + 'construct:conditional_variance'
+    gap_id = mod.PREFIX + 'use-gap:conditional_variance'
+    bundle_id = mod.PREFIX + 'quantity-bundle'
+
+    with SynapseStore(db_path) as store:
+        src = Claim(claim_id='fixture:source', claim_kind='theorem', mathematical_latex='x', title='fixture source')
+        store.put_claim(src)
+        packet = {
+            'format_version': 1,
+            'sources': {'fixture:source': src.meaning_digest},
+            'definition_sources': {key: ['fixture:source'] for key in mod.DEFINITIONS},
+        }
+        mod.build_delta(store, packet)
+
+        bundle = store.get_object(bundle_id)
+        tampered_payload = dict(bundle.spec_payload)
+        tampered_q = [dict(item) for item in tampered_payload['quantity_definitions']]
+        tampered_q[0]['formula'] = '{"formula":"TAMPERED"}'
+        tampered_payload['quantity_definitions'] = tampered_q
+        store.put_object(bundle.model_copy(update={'spec_payload': tampered_payload}), allow_revision=True, reason='tamper q')
+        tampered_detail = mod.inspect_definition(store, 'conditional_variance')
+        assert tampered_detail['definition_matches_current_checker'] is False
+        assert tampered_detail['definition_ref']['revision_digest'] == mod._digest(tampered_q[0])
+
+        mod.build_delta(store, packet)
+        gap = store.get_object(gap_id)
+        store.put_object(
+            gap.model_copy(update={'spec_payload': {**gap.spec_payload, 'dependencies': []}}),
+            allow_revision=True,
+            reason='empty deps',
+        )
+        with pytest.raises(ValueError, match='dependencies'):
+            mod.inspect_definition(store, 'conditional_variance')
+
+        uri_deps = [dict(gap.spec_payload['dependencies'][0])]
+        uri_deps[0]['source_ref'] = {'kind': 'statement', 'node_id': 'synapse://local/claim/fixture:source'}
+        store.put_object(
+            gap.model_copy(update={'spec_payload': {**gap.spec_payload, 'dependencies': uri_deps}}),
+            allow_revision=True,
+            reason='local uri dep',
+        )
+        ok_uri_detail = mod.inspect_definition(store, 'conditional_variance')
+        assert ok_uri_detail['sources'][0]['statement_id'] == 'fixture:source'
+
+        store.put_edge(
+            Edge(
+                edge_id='fixture:extra-entails',
+                source_ref='fixture:source',
+                edge_type='entails',
+                target_ref=sid,
+                assertion_mode='conjectured',
+                metadata={'dependency_kind': 'source', 'expected_revision_digest': src.meaning_digest},
+            )
+        )
+        with pytest.raises(ValueError, match='entails'):
+            mod.inspect_definition(store, 'conditional_variance')
+
+        con = store.get_object(cid)
+        store.put_object(
+            con.model_copy(update={'spec_payload': {**con.spec_payload, 'uses_symbols': []}}),
+            allow_revision=True,
+            reason='clear symbols',
+        )
+        with pytest.raises(KeyError, match='symbol'):
+            mod.compute_construct_feasibility(store, cid)
+
+
+def test_build_delta_atomic_rollback_and_idempotent_source_updates(tmp_path, monkeypatch):
+    pytest.importorskip('synapse')
+    from synapse.models import Claim
+    from synapse.store import SynapseStore
+
+    db_path = tmp_path / 'atomic.sqlite'
+    with SynapseStore(db_path) as store:
+        src_a = Claim(claim_id='fixture:a', claim_kind='theorem', mathematical_latex='a', title='source a')
+        src_b = Claim(claim_id='fixture:b', claim_kind='theorem', mathematical_latex='b', title='source b')
+        store.put_claim(src_a)
+        store.put_claim(src_b)
+        packet_ab = {
+            'format_version': 1,
+            'sources': {'fixture:a': src_a.meaning_digest, 'fixture:b': src_b.meaning_digest},
+            'definition_sources': {
+                key: (['fixture:a', 'fixture:b'] if key == 'conditional_variance' else ['fixture:a'])
+                for key in mod.DEFINITIONS
+            },
+        }
+
+        def fail_assembly(*_args, **_kwargs):
+            raise RuntimeError('simulated mid-run failure')
+
+        monkeypatch.setattr(store, 'put_assembly', fail_assembly)
+        with pytest.raises(RuntimeError, match='simulated mid-run failure'):
+            mod.build_delta(store, packet_ab)
+        monkeypatch.undo()
+
+        assert store.get_source(mod.PREFIX + 'normalization-source') is None
+        assert store.get_object(mod.PREFIX + 'quantity-bundle') is None
+        assert store.get_claim(mod.PREFIX + 'statement:conditional_variance') is None
+        assert store.connection.execute(f"SELECT COUNT(*) FROM edges WHERE edge_id LIKE '{mod.PREFIX}%'").fetchone()[0] == 0
+
+        mod.build_delta(store, packet_ab)
+        packet_ba = {
+            **packet_ab,
+            'definition_sources': {
+                **packet_ab['definition_sources'],
+                'conditional_variance': ['fixture:b', 'fixture:a'],
+            },
+        }
+        mod.build_delta(store, packet_ba)
+        packet_b_only = {
+            'format_version': 1,
+            'sources': {'fixture:a': src_a.meaning_digest, 'fixture:b': src_b.meaning_digest},
+            'definition_sources': {
+                key: (['fixture:b'] if key == 'conditional_variance' else ['fixture:a'])
+                for key in mod.DEFINITIONS
+            },
+        }
+        mod.build_delta(store, packet_b_only)
+        rows = store.connection.execute(
+            'SELECT source_ref FROM edges WHERE edge_id LIKE ?',
+            (f'{mod.PREFIX}source-link:conditional_variance:%',),
+        ).fetchall()
+        assert [r[0] for r in rows] == ['fixture:b']
+        detail = mod.inspect_definition(store, 'conditional_variance')
+        assert [s['statement_id'] for s in detail['sources']] == ['fixture:b']
+
+
+def test_live_migrated_store_compatibility_preserves_meaning_digests(tmp_path, monkeypatch, capsys):
+    pytest.importorskip('synapse')
+    import json
+    from synapse.store import SynapseStore
+
+    live_db = Path('/Users/steveyang/Projects/steveya/volatility-forecast/.synapse/knowledge.sqlite')
+    if not live_db.is_file():
+        pytest.skip('Live volatility-forecast Synapse store not present on disk')
+    real_packet = Path(__file__).parents[1] / 'research' / 'definition_slice_sources.json'
+
+    live_copy = tmp_path / 'live-copy.sqlite'
+    with SynapseStore(live_db, read_only=True) as ro_live:
+        ro_live.backup_to(live_copy)
+
+    with SynapseStore(live_copy, read_only=True) as ro_before:
+        before_digests = {
+            str(r[0]): str(r[1])
+            for r in ro_before.connection.execute('SELECT claim_id, meaning_digest FROM claims').fetchall()
+        }
+        for key in mod.DEFINITIONS:
+            pre_detail = mod.inspect_definition(ro_before, key)
+            assert pre_detail['sources'] and not all(s['current'] for s in pre_detail['sources'])
+            assert pre_detail['scientific_status']['epistemic_badge'] == 'conjectured'
+
+    out_audit = tmp_path / 'live_audit'
+    monkeypatch.setattr(
+        sys,
+        'argv',
+        ['definition_slice', '--db', str(live_copy), '--packet', str(real_packet), '--output', str(out_audit)],
+    )
+    mod.main()
+    audit_payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert audit_payload['mode'] == 'audit_only'
+    assert audit_payload['ready'] is True
+    assert audit_payload['dangling_refs'] == []
+
+    with SynapseStore(live_copy, read_only=True) as ro_after_audit:
+        assert [
+            e
+            for e in ro_after_audit.list_edges(edge_type='entails')
+            if e.target_ref == mod.PREFIX + 'statement:conditional_variance'
+        ] == []
+
+    out_rec = tmp_path / 'live_rec'
+    monkeypatch.setattr(
+        sys,
+        'argv',
+        ['definition_slice', '--db', str(live_copy), '--packet', str(real_packet), '--output', str(out_rec), '--record'],
+    )
+    mod.main()
+    rec_payload = json.loads(capsys.readouterr().out)
+    assert rec_payload['dangling_refs'] == 0
+
+    assert not Path(f'{live_copy}-wal').exists()
+    assert not Path(f'{live_copy}-shm').exists()
+    with SynapseStore(live_copy, read_only=True) as ro_after:
+        after_digests = {
+            str(r[0]): str(r[1])
+            for r in ro_after.connection.execute('SELECT claim_id, meaning_digest FROM claims').fetchall()
+        }
+        assert after_digests == before_digests
+        for key in mod.DEFINITIONS:
+            detail = mod.inspect_definition(ro_after, key)
+            assert detail['sources'] and all(s['current'] for s in detail['sources'])
+            assert detail['definition_matches_current_checker'] is True
+            assert detail['scientific_status']['epistemic_badge'] == 'conjectured'
+            assert detail['scientific_status']['deductive_status'] == 'unproved'
+            assert detail['scientific_status']['inferential_status'] == 'untested'
+            assert detail['empirical_support'] is False
